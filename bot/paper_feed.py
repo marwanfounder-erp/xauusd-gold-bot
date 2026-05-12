@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -27,22 +28,26 @@ class PaperDataFeed:
         return YAHOO_SYMBOLS.get(symbol, symbol)
 
     def get_tick(self, symbol: str) -> Optional[dict]:
-        try:
-            ticker = yf.Ticker(self._yahoo_symbol(symbol))
-            data = ticker.history(period="1d", interval="1m")
-            if data.empty:
-                return None
-            price = float(data["Close"].iloc[-1])
-            half = PAPER_SPREAD_DOLLARS / 2
-            return {
-                "bid": round(price - half, 2),
-                "ask": round(price + half, 2),
-                "spread_dollars": PAPER_SPREAD_DOLLARS,
-                "time": datetime.utcnow(),
-            }
-        except Exception as e:
-            logger.error(f"PaperFeed get_tick error: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(self._yahoo_symbol(symbol))
+                data = ticker.history(period="1d", interval="1m", timeout=10)
+                if data.empty:
+                    return None
+                price = float(data["Close"].iloc[-1])
+                half = PAPER_SPREAD_DOLLARS / 2
+                return {
+                    "bid": round(price - half, 2),
+                    "ask": round(price + half, 2),
+                    "spread_dollars": PAPER_SPREAD_DOLLARS,
+                    "time": datetime.utcnow(),
+                }
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    logger.warning(f"PaperFeed get_tick failed after 3 attempts: {e}")
+        return None
 
     def get_candles(self, symbol: str, timeframe: str, count: int) -> Optional[pd.DataFrame]:
         tf_map = {
@@ -61,18 +66,22 @@ class PaperDataFeed:
         else:
             period = "2y"
 
-        try:
-            ticker = yf.Ticker(self._yahoo_symbol(symbol))
-            data = ticker.history(period=period, interval=interval)
-            if data.empty:
-                return None
-            data.index = data.index.tz_localize(None) if data.index.tzinfo else data.index
-            data.columns = [c.lower() for c in data.columns]
-            data = data[["open", "high", "low", "close", "volume"]].tail(count)
-            return data
-        except Exception as e:
-            logger.error(f"PaperFeed get_candles error: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(self._yahoo_symbol(symbol))
+                data = ticker.history(period=period, interval=interval, timeout=15)
+                if data.empty:
+                    return None
+                data.index = data.index.tz_localize(None) if data.index.tzinfo else data.index
+                data.columns = [c.lower() for c in data.columns]
+                data = data[["open", "high", "low", "close", "volume"]].tail(count)
+                return data
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    logger.warning(f"PaperFeed get_candles failed after 3 attempts: {e}")
+        return None
 
     def get_account_info(self) -> dict:
         balance = PAPER_STARTING_BALANCE

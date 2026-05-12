@@ -1,8 +1,6 @@
 """
 Vercel entry point for XAUUSD Gold Bot.
 Exposes Flask `app` (required by Vercel Python runtime).
-Dashboard + API served here. Bot loop runs in background thread.
-State is persisted in Neon PostgreSQL so it survives instance restarts.
 """
 
 import sys
@@ -13,12 +11,11 @@ import logging
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, Response
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-os.makedirs("logs", exist_ok=True)
 LOG_BUFFER = deque(maxlen=500)
 
 class BufferHandler(logging.Handler):
@@ -28,10 +25,7 @@ class BufferHandler(logging.Handler):
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        BufferHandler(),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout), BufferHandler()],
 )
 logger = logging.getLogger("vercel")
 
@@ -46,24 +40,13 @@ from bot.notifier import TelegramNotifier
 from bot.database import Database
 from bot.dashboard_server import GOLD_HTML
 
-# ── Shared bot state ──────────────────────────────────────────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
 _state: dict = {
-    "mode": "paper",
-    "balance": 0.0,
-    "equity": 0.0,
-    "daily_pnl": 0.0,
-    "open_positions": 0,
-    "price": {},
-    "positions": [],
-    "trades": [],
-    "risk": {},
-    "news": [],
-    "equity_curve": [],
-    "logs": [],
-    "running": False,
+    "mode": "paper", "balance": 0.0, "equity": 0.0, "daily_pnl": 0.0,
+    "open_positions": 0, "price": {}, "positions": [], "trades": [],
+    "risk": {}, "news": [], "equity_curve": [], "logs": [], "running": False,
 }
 
-# ── Bot initialisation (once per process) ─────────────────────────────────────
 _bot_started = False
 _bot_lock = threading.Lock()
 
@@ -74,6 +57,37 @@ risk = RiskManager(settings, feed, db)
 executor = TradeExecutor(settings, feed, db)
 news_filter = NewsFilter(settings)
 notifier = TelegramNotifier(settings)
+
+# ── Startup guard — prevent Telegram spam across Vercel cold starts ───────────
+_STARTUP_COOLDOWN_MINUTES = 10
+_STARTUP_FLAG_TABLE = """
+CREATE TABLE IF NOT EXISTS gold_startup_log (
+    id         SERIAL PRIMARY KEY,
+    started_at TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+def _should_send_startup_notification() -> bool:
+    """Return True only if no startup was recorded in the last 10 minutes."""
+    if not db.conn:
+        return False
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute(_STARTUP_FLAG_TABLE)
+            cur.execute(
+                "SELECT started_at FROM gold_startup_log "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                last = row[0].replace(tzinfo=None) if row[0].tzinfo else row[0]
+                if datetime.utcnow() - last < timedelta(minutes=_STARTUP_COOLDOWN_MINUTES):
+                    return False
+            cur.execute("INSERT INTO gold_startup_log DEFAULT VALUES")
+            return True
+    except Exception as e:
+        logger.warning(f"Startup log check failed: {e}")
+        return False
 
 
 def _start_bot():
@@ -87,12 +101,17 @@ def _start_bot():
     feed.connect()
 
     balance = feed.get_account_info().get("balance", 5000.0)
-    notifier.send_startup("paper", balance)
-    logger.info(f"Gold Bot started on Vercel | balance=${balance:.2f}")
+    logger.info(f"Gold Bot process started | balance=${balance:.2f}")
+
+    # Only send Telegram once per 10 min across all Vercel instances
+    if _should_send_startup_notification():
+        notifier.send_startup("paper", balance)
 
     thread = threading.Thread(target=_bot_loop, daemon=True)
     thread.start()
 
+
+# ── Bot loop ──────────────────────────────────────────────────────────────────
 
 def _bot_loop():
     _state["running"] = True
@@ -131,7 +150,6 @@ def _bot_loop():
                     drawdown=risk.get_total_drawdown_pct(),
                 )
 
-            # Monitor open positions
             for pos in positions:
                 _manage_position(pos)
 
@@ -162,8 +180,8 @@ def _bot_loop():
                 lot_size = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
                 trade = executor.execute_signal(signal, lot_size)
                 if trade:
-                    balance = account.get("balance", 5000.0) if account else 5000.0
-                    notifier.send_signal(signal, lot_size, balance)
+                    balance_now = account.get("balance", 5000.0) if account else 5000.0
+                    notifier.send_signal(signal, lot_size, balance_now)
                     logger.info(
                         f"Trade opened | {signal['direction']} {lot_size} lots "
                         f"@ ${signal['entry']:.2f} [{signal.get('session')}]"
@@ -216,6 +234,7 @@ def _close_position(pos, reason="manual", close_price=None):
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+
 
 def _session_name():
     h = datetime.utcnow().hour
