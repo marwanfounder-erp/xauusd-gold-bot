@@ -1,20 +1,29 @@
+"""
+Paper data feed — Finnhub primary (works on Vercel), yfinance local fallback.
+"""
+
 import logging
+import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
-import yfinance as yf
+import requests
 
 logger = logging.getLogger(__name__)
 
-YAHOO_SYMBOLS = {
-    "XAUUSD": "GC=F",
-    "XAUUSD=X": "GC=F",
-}
-
-PAPER_SPREAD_DOLLARS = 0.20   # $0.20 spread
+PAPER_SPREAD_DOLLARS = 0.20
 PAPER_STARTING_BALANCE = 5000.0
+
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+# OANDA:XAU_USD = Gold/USD spot on Finnhub
+FINNHUB_SYMBOL = "OANDA:XAU_USD"
+
+FINNHUB_RESOLUTION = {
+    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "4h": "240", "1d": "D",
+}
 
 
 class PaperDataFeed:
@@ -23,65 +32,128 @@ class PaperDataFeed:
         self.db = db
         self._positions: list = []
         self._next_ticket = 1
+        self._api_key: str = getattr(config, "finnhub_api_key", "")
 
-    def _yahoo_symbol(self, symbol: str) -> str:
-        return YAHOO_SYMBOLS.get(symbol, symbol)
+    # ── Finnhub helpers ───────────────────────────────────────────────────────
 
-    def get_tick(self, symbol: str) -> Optional[dict]:
-        for attempt in range(3):
-            try:
-                ticker = yf.Ticker(self._yahoo_symbol(symbol))
-                data = ticker.history(period="1d", interval="1m", timeout=10)
-                if data.empty:
-                    return None
-                price = float(data["Close"].iloc[-1])
-                half = PAPER_SPREAD_DOLLARS / 2
-                return {
-                    "bid": round(price - half, 2),
-                    "ask": round(price + half, 2),
-                    "spread_dollars": PAPER_SPREAD_DOLLARS,
-                    "time": datetime.utcnow(),
-                }
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    logger.warning(f"PaperFeed get_tick failed after 3 attempts: {e}")
-        return None
+    def _finnhub_get(self, endpoint: str, params: dict) -> Optional[dict]:
+        if not self._api_key:
+            return None
+        try:
+            params["token"] = self._api_key
+            resp = requests.get(
+                f"{FINNHUB_BASE}/{endpoint}",
+                params=params,
+                timeout=8,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"Finnhub {endpoint} error: {e}")
+            return None
 
-    def get_candles(self, symbol: str, timeframe: str, count: int) -> Optional[pd.DataFrame]:
+    # ── yfinance fallback (local only) ────────────────────────────────────────
+
+    def _yfinance_tick(self, symbol: str) -> Optional[dict]:
+        try:
+            import yfinance as yf
+            yf.set_tz_cache_location("/tmp/yfinance")
+            ticker = yf.Ticker("GC=F")
+            data = ticker.history(period="1d", interval="1m", timeout=10)
+            if data.empty:
+                return None
+            price = float(data["Close"].iloc[-1])
+            half = PAPER_SPREAD_DOLLARS / 2
+            return {
+                "bid": round(price - half, 2),
+                "ask": round(price + half, 2),
+                "spread_dollars": PAPER_SPREAD_DOLLARS,
+                "time": datetime.utcnow(),
+                "source": "yfinance",
+            }
+        except Exception as e:
+            logger.warning(f"yfinance tick fallback failed: {e}")
+            return None
+
+    def _yfinance_candles(self, timeframe: str, count: int) -> Optional[pd.DataFrame]:
         tf_map = {
             "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
             "1h": "1h", "4h": "4h", "1d": "1d",
         }
         interval = tf_map.get(timeframe, "1h")
+        period_map = {
+            "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
+            "1h": "730d", "4h": "730d", "1d": "2y",
+        }
+        period = period_map.get(interval, "730d")
+        try:
+            import yfinance as yf
+            yf.set_tz_cache_location("/tmp/yfinance")
+            data = ticker = yf.Ticker("GC=F")
+            data = ticker.history(period=period, interval=interval, timeout=15)
+            if data.empty:
+                return None
+            data.index = data.index.tz_localize(None) if data.index.tzinfo else data.index
+            data.columns = [c.lower() for c in data.columns]
+            return data[["open", "high", "low", "close", "volume"]].tail(count)
+        except Exception as e:
+            logger.warning(f"yfinance candles fallback failed: {e}")
+            return None
 
-        # yfinance period selection
-        if interval in ("1m",):
-            period = "7d"
-        elif interval in ("5m", "15m", "30m"):
-            period = "60d"
-        elif interval in ("1h",):
-            period = "730d"
-        else:
-            period = "2y"
+    # ── Public API ────────────────────────────────────────────────────────────
 
-        for attempt in range(3):
+    def get_tick(self, symbol: str) -> Optional[dict]:
+        # Try Finnhub first
+        data = self._finnhub_get("quote", {"symbol": FINNHUB_SYMBOL})
+        if data and data.get("c"):
+            price = float(data["c"])
+            half = PAPER_SPREAD_DOLLARS / 2
+            logger.debug(f"Finnhub tick: ${price:.2f}")
+            return {
+                "bid": round(price - half, 2),
+                "ask": round(price + half, 2),
+                "spread_dollars": PAPER_SPREAD_DOLLARS,
+                "time": datetime.utcnow(),
+                "source": "finnhub",
+            }
+        # Fall back to yfinance (works locally, not on Vercel)
+        logger.warning("Finnhub tick failed — trying yfinance fallback")
+        return self._yfinance_tick(symbol)
+
+    def get_candles(self, symbol: str, timeframe: str, count: int) -> Optional[pd.DataFrame]:
+        resolution = FINNHUB_RESOLUTION.get(timeframe, "60")
+        # Need enough history: count bars × bar duration in seconds
+        bar_seconds = {"1": 60, "5": 300, "15": 900, "30": 1800,
+                       "60": 3600, "240": 14400, "D": 86400}
+        secs = bar_seconds.get(resolution, 3600)
+        to_ts = int(datetime.now(timezone.utc).timestamp())
+        from_ts = to_ts - (secs * count * 2)  # fetch 2× to ensure enough bars
+
+        data = self._finnhub_get(
+            "forex/candle",
+            {"symbol": FINNHUB_SYMBOL, "resolution": resolution,
+             "from": from_ts, "to": to_ts},
+        )
+
+        if data and data.get("s") == "ok" and data.get("c"):
             try:
-                ticker = yf.Ticker(self._yahoo_symbol(symbol))
-                data = ticker.history(period=period, interval=interval, timeout=15)
-                if data.empty:
-                    return None
-                data.index = data.index.tz_localize(None) if data.index.tzinfo else data.index
-                data.columns = [c.lower() for c in data.columns]
-                data = data[["open", "high", "low", "close", "volume"]].tail(count)
-                return data
+                df = pd.DataFrame({
+                    "open":   data["o"],
+                    "high":   data["h"],
+                    "low":    data["l"],
+                    "close":  data["c"],
+                    "volume": data.get("v", [0] * len(data["c"])),
+                }, index=pd.to_datetime(data["t"], unit="s", utc=True))
+                df.index = df.index.tz_localize(None)
+                df = df.sort_index().tail(count)
+                logger.debug(f"Finnhub candles: {len(df)} bars ({timeframe})")
+                return df
             except Exception as e:
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    logger.warning(f"PaperFeed get_candles failed after 3 attempts: {e}")
-        return None
+                logger.warning(f"Finnhub candle parse error: {e}")
+
+        # Fall back to yfinance
+        logger.warning("Finnhub candles failed — trying yfinance fallback")
+        return self._yfinance_candles(timeframe, count)
 
     def get_account_info(self) -> dict:
         balance = PAPER_STARTING_BALANCE
@@ -100,7 +172,6 @@ class PaperDataFeed:
         }
 
     def get_positions(self) -> list:
-        # Update unrealized P&L
         for pos in self._positions:
             tick = self.get_tick(pos["symbol"])
             if tick:
@@ -115,16 +186,9 @@ class PaperDataFeed:
         ticket = self._next_ticket
         self._next_ticket += 1
         pos = {
-            "ticket": ticket,
-            "symbol": symbol,
-            "type": direction,
-            "volume": volume,
-            "price_open": entry,
-            "sl": sl,
-            "tp": tp,
-            "profit": 0.0,
-            "unrealized_profit": 0.0,
-            "time": datetime.utcnow(),
+            "ticket": ticket, "symbol": symbol, "type": direction,
+            "volume": volume, "price_open": entry, "sl": sl, "tp": tp,
+            "profit": 0.0, "unrealized_profit": 0.0, "time": datetime.utcnow(),
         }
         self._positions.append(pos)
         logger.info(f"Paper position opened | {direction} {volume} lots @ {entry:.2f} SL={sl:.2f} TP={tp:.2f}")
@@ -154,7 +218,8 @@ class PaperDataFeed:
         return False
 
     def connect(self) -> bool:
-        logger.info("PaperFeed initialized (yfinance GC=F)")
+        source = "Finnhub" if self._api_key else "yfinance (no Finnhub key)"
+        logger.info(f"PaperFeed initialized | price source: {source}")
         return True
 
     def disconnect(self):
