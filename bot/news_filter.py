@@ -1,86 +1,118 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-# Gold-relevant currencies and keywords
-GOLD_RELEVANT_CURRENCIES = {"USD", "XAU"}
-GOLD_RELEVANT_KEYWORDS = {
-    "gold", "fed", "fomc", "nfp", "cpi", "inflation", "interest rate",
-    "powell", "jobs", "employment", "gdp", "pce", "treasury",
+FINNHUB_CALENDAR_URL = "https://finnhub.io/api/v1/calendar/economic"
+
+# USD events move gold the most
+GOLD_RELEVANT_COUNTRIES = {"US"}
+
+# Only block on high/medium impact events
+BLOCK_IMPACTS = {"high", "medium"}
+
+# Keywords that always block regardless of impact level
+HIGH_SENSITIVITY_KEYWORDS = {
+    "nfp", "non-farm", "fomc", "fed", "interest rate", "cpi", "inflation",
+    "pce", "gdp", "jobs", "employment", "powell", "treasury", "fed funds",
 }
-HIGH_IMPACT_ONLY = True
 
 
 class NewsFilter:
     def __init__(self, config):
         self.config = config
         self._cache: list = []
-        self._cache_time: Optional[datetime] = None
-        self._cache_ttl = timedelta(minutes=30)
+        self._cache_date: Optional[date] = None
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+
+    def _fetch_finnhub(self, from_date: str, to_date: str) -> list:
+        if not self.config.finnhub_api_key:
+            logger.warning("FINNHUB_API_KEY not set — news filter disabled")
+            return []
+        try:
+            resp = requests.get(
+                FINNHUB_CALENDAR_URL,
+                params={
+                    "from": from_date,
+                    "to": to_date,
+                    "token": self.config.finnhub_api_key,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("economicCalendar", [])
+        except Exception as e:
+            logger.warning(f"Finnhub fetch failed: {e} — allowing trading")
+            return []
 
     def fetch_news(self) -> list:
-        if (
-            self._cache_time
-            and datetime.utcnow() - self._cache_time < self._cache_ttl
-        ):
+        today = date.today()
+        if self._cache_date == today and self._cache:
             return self._cache
 
-        try:
-            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            events = resp.json()
-            gold_events = []
-            for e in events:
-                currency = e.get("country", "").upper()
-                impact = e.get("impact", "").lower()
-                title = e.get("title", "").lower()
+        # Fetch today + tomorrow to catch events at day boundaries
+        from_str = today.strftime("%Y-%m-%d")
+        to_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = self._fetch_finnhub(from_str, to_str)
 
-                if currency not in GOLD_RELEVANT_CURRENCIES:
-                    continue
-                if HIGH_IMPACT_ONLY and impact not in ("high", "medium"):
-                    continue
+        events = []
+        for e in raw:
+            country = (e.get("country") or "").upper()
+            impact = (e.get("impact") or "").lower()
+            title = (e.get("event") or "").lower()
+            time_str = e.get("time") or ""          # ISO 8601 e.g. "2026-05-12T12:30:00"
 
-                gold_events.append({
-                    "title": e.get("title", ""),
-                    "currency": currency,
-                    "impact": impact,
-                    "date": e.get("date", ""),
-                    "time": e.get("time", ""),
-                })
+            if country not in GOLD_RELEVANT_COUNTRIES:
+                continue
 
-            self._cache = gold_events
-            self._cache_time = datetime.utcnow()
-            logger.info(f"News fetched: {len(gold_events)} gold-relevant events")
-            return gold_events
+            # Include if impact is high/medium OR title matches sensitive keywords
+            is_sensitive = any(kw in title for kw in HIGH_SENSITIVITY_KEYWORDS)
+            if impact not in BLOCK_IMPACTS and not is_sensitive:
+                continue
 
-        except Exception as e:
-            logger.warning(f"News fetch failed: {e} — allowing trading")
-            return self._cache
+            try:
+                event_dt = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                logger.debug(f"Could not parse event time: {time_str}")
+                continue
+
+            events.append({
+                "title": e.get("event", ""),
+                "country": country,
+                "impact": impact,
+                "event_time": event_dt,
+                "actual": e.get("actual"),
+                "estimate": e.get("estimate"),
+                "prev": e.get("prev"),
+            })
+
+        self._cache = events
+        self._cache_date = today
+        logger.info(f"Finnhub: {len(events)} gold-relevant events loaded for {today}")
+        return events
+
+    # ── Checks ────────────────────────────────────────────────────────────────
 
     def is_news_time(self) -> tuple[bool, str]:
         now = datetime.utcnow()
+        before = timedelta(minutes=self.config.news_filter_before_minutes)
+        after = timedelta(minutes=self.config.news_filter_after_minutes)
+
         try:
-            events = self.fetch_news()
-            for event in events:
-                try:
-                    event_dt_str = f"{event['date']} {event['time']}"
-                    event_dt = datetime.strptime(event_dt_str, "%Y-%m-%d %I:%M%p")
-                except ValueError:
-                    continue
-
-                before = timedelta(minutes=self.config.news_filter_before_minutes)
-                after = timedelta(minutes=self.config.news_filter_after_minutes)
-
+            for event in self.fetch_news():
+                event_dt = event["event_time"]
                 if event_dt - before <= now <= event_dt + after:
-                    msg = f"{event['impact'].upper()} news: {event['title']} @ {event_dt}"
+                    msg = (
+                        f"{event['impact'].upper()} | {event['title']} "
+                        f"@ {event_dt.strftime('%H:%M UTC')}"
+                    )
                     logger.info(f"News block active: {msg}")
                     return True, msg
-
         except Exception as e:
             logger.warning(f"News check error: {e}")
 
@@ -88,17 +120,12 @@ class NewsFilter:
 
     def get_upcoming_events(self, hours_ahead: int = 4) -> list:
         now = datetime.utcnow()
+        cutoff = now + timedelta(hours=hours_ahead)
         upcoming = []
         try:
             for event in self.fetch_news():
-                try:
-                    event_dt = datetime.strptime(
-                        f"{event['date']} {event['time']}", "%Y-%m-%d %I:%M%p"
-                    )
-                except ValueError:
-                    continue
-                if now <= event_dt <= now + timedelta(hours=hours_ahead):
-                    upcoming.append({**event, "event_time": event_dt})
+                if now <= event["event_time"] <= cutoff:
+                    upcoming.append(event)
         except Exception:
             pass
         return upcoming

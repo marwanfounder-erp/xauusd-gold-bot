@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     breakeven_trigger_ratio: float = 0.5   # move SL to BE at 50% to TP
     max_trade_hours: int = 20              # close after 20 hours
 
+    # News — Finnhub
+    finnhub_api_key: str = ""
+
     # Database
     database_url: str = ""
     db_table_prefix: str = "gold_"
