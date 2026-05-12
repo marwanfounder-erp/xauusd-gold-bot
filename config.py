@@ -57,8 +57,8 @@ class Settings(BaseSettings):
     database_url: str = ""
     db_table_prefix: str = "gold_"
 
-    # Dashboard
-    dashboard_port: int = 8081         # Different port from EURUSD
+    # Dashboard — Railway injects PORT env var; fall back to 8081 locally
+    dashboard_port: int = int(os.environ.get("PORT", 8081))
 
     class Config:
         env_file = ".env"
