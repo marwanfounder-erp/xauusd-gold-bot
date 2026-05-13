@@ -1,6 +1,7 @@
 """
-Vercel entry point for XAUUSD Gold Bot.
-Exposes Flask `app` (required by Vercel Python runtime).
+Vercel entry point — XAUUSD Gold Bot.
+Each API endpoint reads directly from its source (Finnhub/DB) so
+Vercel cold starts never show zeros. Background thread handles trading.
 """
 
 import sys
@@ -40,16 +41,7 @@ from bot.notifier import TelegramNotifier
 from bot.database import Database
 from bot.dashboard_server import GOLD_HTML
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-_state: dict = {
-    "mode": "paper", "balance": 0.0, "equity": 0.0, "daily_pnl": 0.0,
-    "open_positions": 0, "price": {}, "positions": [], "trades": [],
-    "risk": {}, "news": [], "equity_curve": [], "logs": [], "running": False,
-}
-
-_bot_started = False
-_bot_lock = threading.Lock()
-
+# ── Singletons ────────────────────────────────────────────────────────────────
 db = Database(settings)
 feed = PaperDataFeed(settings, db)
 strategy = XAUUSDStrategy(settings, feed)
@@ -58,35 +50,47 @@ executor = TradeExecutor(settings, feed, db)
 news_filter = NewsFilter(settings)
 notifier = TelegramNotifier(settings)
 
-# ── Startup guard — prevent Telegram spam across Vercel cold starts ───────────
-_STARTUP_COOLDOWN_MINUTES = 10
-_STARTUP_FLAG_TABLE = """
+# ── Price cache (30s TTL — avoids hammering Finnhub on every dashboard poll) ──
+_tick_cache: dict = {"data": None, "ts": 0.0}
+_TICK_TTL = 30  # seconds
+
+def _get_tick():
+    now = time.time()
+    if _tick_cache["data"] and (now - _tick_cache["ts"]) < _TICK_TTL:
+        return _tick_cache["data"]
+    tick = feed.get_tick(settings.symbol)
+    if tick:
+        _tick_cache["data"] = tick
+        _tick_cache["ts"] = now
+    return tick or _tick_cache.get("data") or {}
+
+# ── Bot startup (once per process) ───────────────────────────────────────────
+_bot_started = False
+_bot_lock = threading.Lock()
+
+_STARTUP_COOLDOWN = 10  # minutes between Telegram startup messages
+_STARTUP_TABLE = """
 CREATE TABLE IF NOT EXISTS gold_startup_log (
-    id         SERIAL PRIMARY KEY,
-    started_at TIMESTAMPTZ DEFAULT NOW()
+    id SERIAL PRIMARY KEY, started_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
 
-def _should_send_startup_notification() -> bool:
-    """Return True only if no startup was recorded in the last 10 minutes."""
+def _should_notify() -> bool:
     if not db.conn:
         return False
     try:
         with db.conn.cursor() as cur:
-            cur.execute(_STARTUP_FLAG_TABLE)
-            cur.execute(
-                "SELECT started_at FROM gold_startup_log "
-                "ORDER BY started_at DESC LIMIT 1"
-            )
+            cur.execute(_STARTUP_TABLE)
+            cur.execute("SELECT started_at FROM gold_startup_log ORDER BY started_at DESC LIMIT 1")
             row = cur.fetchone()
             if row:
                 last = row[0].replace(tzinfo=None) if row[0].tzinfo else row[0]
-                if datetime.utcnow() - last < timedelta(minutes=_STARTUP_COOLDOWN_MINUTES):
+                if datetime.utcnow() - last < timedelta(minutes=_STARTUP_COOLDOWN):
                     return False
             cur.execute("INSERT INTO gold_startup_log DEFAULT VALUES")
             return True
     except Exception as e:
-        logger.warning(f"Startup log check failed: {e}")
+        logger.warning(f"Startup log error: {e}")
         return False
 
 
@@ -96,59 +100,20 @@ def _start_bot():
         if _bot_started:
             return
         _bot_started = True
-
     db.connect()
     feed.connect()
-
-    balance = feed.get_account_info().get("balance", 5000.0)
-    logger.info(f"Gold Bot process started | balance=${balance:.2f}")
-
-    # Only send Telegram once per 10 min across all Vercel instances
-    if _should_send_startup_notification():
-        notifier.send_startup("paper", balance)
-
-    thread = threading.Thread(target=_bot_loop, daemon=True)
-    thread.start()
+    logger.info("Gold Bot process started on Vercel")
+    if _should_notify():
+        acct = feed.get_account_info()
+        notifier.send_startup("paper", acct.get("balance", 5000.0))
+    threading.Thread(target=_bot_loop, daemon=True).start()
 
 
-# ── Bot loop ──────────────────────────────────────────────────────────────────
-
+# ── Trading loop ──────────────────────────────────────────────────────────────
 def _bot_loop():
-    _state["running"] = True
     while True:
         try:
-            tick = feed.get_tick(settings.symbol)
-            account = feed.get_account_info()
             positions = feed.get_positions()
-            trades_db = db.get_trades(limit=50) if db.conn else []
-            daily_pnl = db.get_daily_pnl() if db.conn else 0.0
-            news_upcoming = news_filter.get_upcoming_events(hours_ahead=4)
-            equity_curve = db.get_equity_curve(limit=100) if db.conn else []
-
-            _state.update({
-                "balance": account.get("balance", 0) if account else 0,
-                "equity": account.get("equity", 0) if account else 0,
-                "daily_pnl": daily_pnl,
-                "open_positions": len(positions),
-                "price": tick or {},
-                "positions": positions,
-                "trades": trades_db,
-                "risk": {
-                    "daily_loss_pct": risk.get_daily_loss_pct(),
-                    "drawdown_pct": risk.get_total_drawdown_pct(),
-                    "open_positions": len(positions),
-                },
-                "news": news_upcoming,
-                "equity_curve": equity_curve,
-                "logs": list(LOG_BUFFER),
-            })
-
-            if account and db.conn:
-                db.save_equity_snapshot(
-                    balance=account.get("balance", 0),
-                    equity=account.get("equity", 0),
-                    drawdown=risk.get_total_drawdown_pct(),
-                )
 
             for pos in positions:
                 _manage_position(pos)
@@ -159,13 +124,12 @@ def _bot_loop():
                 time.sleep(60)
                 continue
 
-            can_trade, reason = risk.can_trade()
+            can_trade, _ = risk.can_trade()
             if not can_trade or positions:
                 time.sleep(60)
                 continue
 
-            news_active, _ = news_filter.is_news_time()
-            if news_active:
+            if news_filter.is_news_time()[0]:
                 time.sleep(60)
                 continue
 
@@ -177,16 +141,15 @@ def _bot_loop():
             logger.info(f"Signal: {signal}")
 
             if signal.get("direction") in ("BUY", "SELL"):
-                lot_size = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
-                trade = executor.execute_signal(signal, lot_size)
+                lot = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
+                trade = executor.execute_signal(signal, lot)
                 if trade:
-                    balance_now = account.get("balance", 5000.0) if account else 5000.0
-                    notifier.send_signal(signal, lot_size, balance_now)
+                    acct = feed.get_account_info()
+                    notifier.send_signal(signal, lot, acct.get("balance", 5000))
                     logger.info(
-                        f"Trade opened | {signal['direction']} {lot_size} lots "
+                        f"Trade | {signal['direction']} {lot} lots "
                         f"@ ${signal['entry']:.2f} [{signal.get('session')}]"
                     )
-
         except Exception as e:
             logger.error(f"Bot loop error: {e}", exc_info=True)
 
@@ -197,28 +160,25 @@ def _manage_position(pos):
     if risk.should_close_by_time(pos):
         _close_position(pos, reason="time_limit")
         return
-
     tick = feed.get_tick(pos["symbol"])
     if tick:
         if pos["type"] == "BUY":
             if tick["bid"] <= pos["sl"]:
-                _close_position(pos, reason="stop_loss", close_price=pos["sl"])
+                _close_position(pos, "stop_loss", pos["sl"])
                 return
             if tick["bid"] >= pos["tp"]:
-                _close_position(pos, reason="take_profit", close_price=pos["tp"])
+                _close_position(pos, "take_profit", pos["tp"])
                 return
         else:
             if tick["ask"] >= pos["sl"]:
-                _close_position(pos, reason="stop_loss", close_price=pos["sl"])
+                _close_position(pos, "stop_loss", pos["sl"])
                 return
             if tick["ask"] <= pos["tp"]:
-                _close_position(pos, reason="take_profit", close_price=pos["tp"])
+                _close_position(pos, "take_profit", pos["tp"])
                 return
-
     new_sl = risk.check_breakeven(pos)
     if new_sl:
         feed.update_sl(pos["ticket"], new_sl)
-        logger.info(f"Breakeven set | ticket={pos['ticket']} new_sl={new_sl:.2f}")
 
 
 def _close_position(pos, reason="manual", close_price=None):
@@ -259,54 +219,65 @@ def health():
     return jsonify({"status": "ok", "symbol": "XAUUSD"})
 
 
-@app.route("/api/status")
-def status():
-    return jsonify({
-        "symbol": "XAUUSD",
-        "mode": _state["mode"],
-        "balance": _state["balance"],
-        "equity": _state["equity"],
-        "daily_pnl": _state["daily_pnl"],
-        "open_positions": _state["open_positions"],
-        "session": _session_name(),
-        "utc_time": datetime.utcnow().strftime("%H:%M UTC"),
-        "running": _state["running"],
-    })
-
-
 @app.route("/api/price")
 def price():
-    return jsonify(_state["price"])
+    # Direct Finnhub call — never returns stale zero
+    tick = _get_tick()
+    return jsonify(tick)
+
+
+@app.route("/api/status")
+def status():
+    # Read balance from DB, positions from memory
+    acct = feed.get_account_info()
+    positions = feed.get_positions()
+    daily_pnl = db.get_daily_pnl() if db.conn else 0.0
+    return jsonify({
+        "symbol": "XAUUSD",
+        "mode": "paper",
+        "balance": acct.get("balance", 5000.0),
+        "equity": acct.get("equity", 5000.0),
+        "daily_pnl": daily_pnl,
+        "open_positions": len(positions),
+        "session": _session_name(),
+        "utc_time": datetime.utcnow().strftime("%H:%M UTC"),
+        "running": True,
+    })
 
 
 @app.route("/api/positions")
 def positions():
-    return jsonify(_state["positions"])
+    return jsonify(feed.get_positions())
 
 
 @app.route("/api/trades")
 def trades():
-    return jsonify(_state["trades"])
+    return jsonify(db.get_trades(limit=50) if db.conn else [])
 
 
 @app.route("/api/risk")
-def risk_endpoint():
-    return jsonify(_state["risk"])
+def risk_api():
+    positions = feed.get_positions()
+    return jsonify({
+        "daily_loss_pct": risk.get_daily_loss_pct(),
+        "drawdown_pct": risk.get_total_drawdown_pct(),
+        "open_positions": len(positions),   # always an int, never undefined
+    })
 
 
 @app.route("/api/news")
 def news():
-    return jsonify(_state["news"])
+    return jsonify(news_filter.get_upcoming_events(hours_ahead=4))
 
 
 @app.route("/api/equity")
 def equity():
-    return jsonify(_state["equity_curve"])
+    return jsonify(db.get_equity_curve(limit=100) if db.conn else [])
 
 
 @app.route("/api/logs")
 def logs():
-    return jsonify({"lines": _state["logs"]})
+    return jsonify({"lines": list(LOG_BUFFER)})
 
 
 if __name__ == "__main__":

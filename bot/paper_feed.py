@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
+import certifi
 import requests
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class PaperDataFeed:
                 f"{FINNHUB_BASE}/{endpoint}",
                 params=params,
                 timeout=8,
+                verify=certifi.where(),
             )
             resp.raise_for_status()
             return resp.json()
