@@ -68,7 +68,7 @@ def _get_tick():
 _bot_started = False
 _bot_lock = threading.Lock()
 
-_STARTUP_COOLDOWN = 10  # minutes between Telegram startup messages
+_STARTUP_COOLDOWN = 360  # minutes between Telegram startup messages (6h — Vercel recycles ~30min)
 _STARTUP_TABLE = """
 CREATE TABLE IF NOT EXISTS gold_startup_log (
     id SERIAL PRIMARY KEY, started_at TIMESTAMPTZ DEFAULT NOW()
