@@ -138,7 +138,7 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
             positions = feed.get_positions()
             trades_db = db.get_trades(limit=50) if db.conn else []
             daily_pnl = db.get_daily_pnl() if db.conn else 0.0
-            news_upcoming = news_filter.get_upcoming_events(hours_ahead=4)
+            news_active, news_msg, news_upcoming = news_filter.check(hours_ahead=4)
             equity_curve = db.get_equity_curve(limit=100) if db.conn else []
 
             dashboard.update(
@@ -192,8 +192,7 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
                 time.sleep(60)
                 continue
 
-            # ── News filter ────────────────────────────────────────────────
-            news_active, news_msg = news_filter.is_news_time()
+            # ── News filter (result already computed above in dashboard section)
             if news_active:
                 logger.info(f"News block: {news_msg}")
                 time.sleep(60)

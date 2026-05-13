@@ -22,57 +22,52 @@ HIGH_SENSITIVITY_KEYWORDS = {
 
 
 class NewsFilter:
+    # ── Class-level cache — one Finnhub call per day across all instances ─────
+    _last_fetch_date: Optional[date] = None
+    _cached_events: list = []
+
     def __init__(self, config):
         self.config = config
-        self._cache: list = []
-        self._cache_date: Optional[date] = None
-        self._cache_fetched: bool = False  # True once fetched for _cache_date, even when 0 events
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
-    def _fetch_finnhub(self, from_date: str, to_date: str) -> list:
+    def _fetch_finnhub(self, from_date: str, to_date: str) -> Optional[list]:
+        """
+        Returns raw economicCalendar list on success, None on any failure.
+        Returning None (not []) lets fetch_news distinguish API failure from
+        a genuinely empty calendar day.
+        """
         if not self.config.finnhub_api_key:
             logger.warning("FINNHUB_API_KEY not set — news filter disabled")
-            return []
+            return None
         try:
             resp = requests.get(
                 FINNHUB_CALENDAR_URL,
                 params={
-                    "from": from_date,
-                    "to": to_date,
+                    "from":  from_date,
+                    "to":    to_date,
                     "token": self.config.finnhub_api_key,
                 },
                 timeout=10,
             )
             resp.raise_for_status()
-            data = resp.json()
-            return data.get("economicCalendar", [])
+            return resp.json().get("economicCalendar", [])
         except Exception as e:
             logger.warning(f"Finnhub fetch failed: {e} — allowing trading")
-            return []
+            return None
 
-    def fetch_news(self) -> list:
-        today = date.today()
-        if self._cache_date == today and self._cache_fetched:
-            logger.debug(f"News cache hit: {len(self._cache)} events for {today}")
-            return self._cache
-
-        # Fetch today + tomorrow to catch events at day boundaries
-        from_str = today.strftime("%Y-%m-%d")
-        to_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-        raw = self._fetch_finnhub(from_str, to_str)
-
+    def _parse_events(self, raw: list) -> list:
+        """Filter and parse raw Finnhub calendar entries into event dicts."""
         events = []
         for e in raw:
-            country = (e.get("country") or "").upper()
-            impact = (e.get("impact") or "").lower()
-            title = (e.get("event") or "").lower()
-            time_str = e.get("time") or ""          # ISO 8601 e.g. "2026-05-12T12:30:00"
+            country  = (e.get("country") or "").upper()
+            impact   = (e.get("impact")  or "").lower()
+            title    = (e.get("event")   or "").lower()
+            time_str =  e.get("time")    or ""
 
             if country not in GOLD_RELEVANT_COUNTRIES:
                 continue
 
-            # Include if impact is high/medium OR title matches sensitive keywords
             is_sensitive = any(kw in title for kw in HIGH_SENSITIVITY_KEYWORDS)
             if impact not in BLOCK_IMPACTS and not is_sensitive:
                 continue
@@ -80,32 +75,109 @@ class NewsFilter:
             try:
                 event_dt = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
             except ValueError:
-                logger.debug(f"Could not parse event time: {time_str}")
+                logger.debug(f"Could not parse event time: {time_str!r}")
                 continue
 
             events.append({
-                "title": e.get("event", ""),
-                "country": country,
-                "impact": impact,
+                "title":      e.get("event", ""),
+                "country":    country,
+                "impact":     impact,
                 "event_time": event_dt,
-                "actual": e.get("actual"),
-                "estimate": e.get("estimate"),
-                "prev": e.get("prev"),
+                "actual":     e.get("actual"),
+                "estimate":   e.get("estimate"),
+                "prev":       e.get("prev"),
             })
-
-        self._cache = events
-        self._cache_date = today
-        self._cache_fetched = True
-        logger.info(f"Finnhub: fresh fetch — {len(events)} gold-relevant events for {today}")
         return events
 
-    # ── Checks ────────────────────────────────────────────────────────────────
+    def fetch_news(self) -> list:
+        """
+        Returns today's gold-relevant events.
+        Hits Finnhub exactly once per UTC day; all subsequent calls return
+        the class-level cache.
+        """
+        today = datetime.utcnow().date()
+
+        # ── Cache hit ──────────────────────────────────────────────────────
+        if NewsFilter._last_fetch_date == today:
+            logger.info(
+                f"News filter status: CACHE HIT — "
+                f"Using cached news events ({len(NewsFilter._cached_events)} events)"
+            )
+            return NewsFilter._cached_events
+
+        # ── Fresh fetch ────────────────────────────────────────────────────
+        logger.info("News filter status: FRESH FETCH — Fetching fresh news from Finnhub")
+        from_str = today.strftime("%Y-%m-%d")
+        to_str   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = self._fetch_finnhub(from_str, to_str)
+
+        if raw is None:
+            # API failed — cache empty list so we don't hammer the API every 60s
+            logger.warning(
+                "News filter status: API FAILED — "
+                "trading with no news filter today"
+            )
+            NewsFilter._last_fetch_date = today
+            NewsFilter._cached_events   = []
+            return []
+
+        events = self._parse_events(raw)
+
+        if not events:
+            logger.warning(
+                "Finnhub returned 0 events — trading with no news filter today"
+            )
+
+        NewsFilter._last_fetch_date = today
+        NewsFilter._cached_events   = events
+        logger.info(
+            f"News filter status: FRESH FETCH — "
+            f"{len(events)} gold-relevant events cached for {today}"
+        )
+        return events
+
+    # ── Single entry point for the main loop ──────────────────────────────────
+
+    def check(self, hours_ahead: int = 4) -> tuple[bool, str, list]:
+        """
+        Call this ONCE per 60s loop cycle.
+        Returns (is_blocked, block_msg, upcoming_events).
+
+        - is_blocked    : True if current time falls inside a news window
+        - block_msg     : human-readable description of the blocking event
+        - upcoming_events: events within the next `hours_ahead` hours (for dashboard)
+        """
+        events = self.fetch_news()
+        logger.info(f"News check: {len(events)} events cached for today")
+
+        now    = datetime.utcnow()
+        before = timedelta(minutes=self.config.news_filter_before_minutes)
+        after  = timedelta(minutes=self.config.news_filter_after_minutes)
+        cutoff = now + timedelta(hours=hours_ahead)
+
+        # Upcoming events for dashboard (computed regardless of blocking)
+        upcoming = [e for e in events if now <= e["event_time"] <= cutoff]
+
+        # Check if we are currently inside a news blackout window
+        for event in events:
+            event_dt = event["event_time"]
+            if event_dt - before <= now <= event_dt + after:
+                block_msg = (
+                    f"{event['impact'].upper()} | {event['title']} "
+                    f"@ {event_dt.strftime('%H:%M UTC')}"
+                )
+                logger.info(f"News block active: {block_msg}")
+                return True, block_msg, upcoming
+
+        return False, "", upcoming
+
+    # ── Legacy helpers — kept for api/index.py compatibility ──────────────────
 
     def is_news_time(self) -> tuple[bool, str]:
-        now = datetime.utcnow()
+        """Thin wrapper used by api/index.py. Hits the class-level cache."""
+        now    = datetime.utcnow()
         before = timedelta(minutes=self.config.news_filter_before_minutes)
-        after = timedelta(minutes=self.config.news_filter_after_minutes)
-
+        after  = timedelta(minutes=self.config.news_filter_after_minutes)
         try:
             for event in self.fetch_news():
                 event_dt = event["event_time"]
@@ -118,17 +190,14 @@ class NewsFilter:
                     return True, msg
         except Exception as e:
             logger.warning(f"News check error: {e}")
-
         return False, ""
 
     def get_upcoming_events(self, hours_ahead: int = 4) -> list:
-        now = datetime.utcnow()
+        """Thin wrapper used by api/index.py. Hits the class-level cache."""
+        now    = datetime.utcnow()
         cutoff = now + timedelta(hours=hours_ahead)
-        upcoming = []
         try:
-            for event in self.fetch_news():
-                if now <= event["event_time"] <= cutoff:
-                    upcoming.append(event)
+            return [e for e in self.fetch_news()
+                    if now <= e["event_time"] <= cutoff]
         except Exception:
-            pass
-        return upcoming
+            return []
