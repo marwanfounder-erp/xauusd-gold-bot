@@ -216,12 +216,24 @@ class PaperDataFeed:
         for pos in self._positions:
             if pos["ticket"] == ticket:
                 pos["sl"] = new_sl
+                # Sync to DB so SL survives Vercel restarts
+                if self.db:
+                    self.db.update_sl(ticket, new_sl, self.config.symbol)
                 return True
         return False
 
     def connect(self) -> bool:
         source = "Finnhub" if self._api_key else "yfinance (no Finnhub key)"
         logger.info(f"PaperFeed initialized | price source: {source}")
+        # Reload open positions from DB so they survive Vercel cold starts
+        if self.db and self.db.conn:
+            open_positions = self.db.get_open_positions()
+            if open_positions:
+                self._positions = open_positions
+                # Set next ticket above highest existing ticket
+                max_ticket = max(p["ticket"] for p in open_positions if p.get("ticket"))
+                self._next_ticket = max_ticket + 1
+                logger.info(f"Reloaded {len(open_positions)} open position(s) from DB")
         return True
 
     def disconnect(self):

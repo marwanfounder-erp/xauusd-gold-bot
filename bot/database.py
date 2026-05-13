@@ -206,6 +206,53 @@ class Database:
             logger.error(f"get_equity_curve error: {e}")
             return []
 
+    def get_open_positions(self) -> list:
+        """Load open paper positions so they survive Vercel restarts."""
+        if not self.conn:
+            return []
+        sql = f"""
+            SELECT ticket, direction, lot_size, entry_price, stop_loss, take_profit,
+                   open_time, session
+            FROM {self.prefix}trades
+            WHERE symbol='{self.config.symbol}' AND status='open' AND mode='paper'
+            ORDER BY open_time ASC
+        """
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            result = []
+            for r in rows:
+                result.append({
+                    "ticket": r["ticket"],
+                    "symbol": self.config.symbol,
+                    "type": r["direction"],
+                    "volume": r["lot_size"],
+                    "price_open": r["entry_price"],
+                    "sl": r["stop_loss"],
+                    "tp": r["take_profit"],
+                    "profit": 0.0,
+                    "unrealized_profit": 0.0,
+                    "time": r["open_time"].replace(tzinfo=None) if r["open_time"] else None,
+                    "session": r["session"],
+                })
+            return result
+        except Exception as e:
+            logger.error(f"get_open_positions error: {e}")
+            return []
+
+    def update_sl(self, ticket: int, new_sl: float, symbol: str):
+        if not self.conn:
+            return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {self.prefix}trades SET stop_loss=%s WHERE ticket=%s AND symbol=%s",
+                    (new_sl, ticket, symbol)
+                )
+        except Exception as e:
+            logger.error(f"update_sl error: {e}")
+
     def get_paper_balance(self, symbol: str) -> Optional[float]:
         if not self.conn:
             return None

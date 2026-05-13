@@ -109,50 +109,58 @@ def _start_bot():
     threading.Thread(target=_bot_loop, daemon=True).start()
 
 
-# ── Trading loop ──────────────────────────────────────────────────────────────
+# ── Trading cycle (called both from loop and per-request) ─────────────────────
+_cycle_lock = threading.Lock()
+
+def _run_trading_cycle():
+    """Single trading check — safe to call from any thread, deduplicated."""
+    if not _cycle_lock.acquire(blocking=False):
+        return  # another cycle is already running
+    try:
+        positions = feed.get_positions()
+
+        for pos in list(positions):
+            _manage_position(pos)
+
+        if risk.should_close_friday() and positions:
+            for pos in positions:
+                _close_position(pos, reason="friday_close")
+            return
+
+        can_trade, _ = risk.can_trade()
+        if not can_trade or positions:
+            return
+
+        if news_filter.is_news_time()[0]:
+            return
+
+        if not (strategy.is_london_session() or strategy.is_ny_session()):
+            return
+
+        signal = strategy.get_signal(settings.symbol)
+        if signal.get("direction") not in ("BUY", "SELL"):
+            return
+
+        logger.info(f"Signal: {signal}")
+        lot = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
+        trade = executor.execute_signal(signal, lot)
+        if trade:
+            acct = feed.get_account_info()
+            notifier.send_signal(signal, lot, acct.get("balance", 5000))
+            logger.info(
+                f"Trade | {signal['direction']} {lot} lots "
+                f"@ ${signal['entry']:.2f} [{signal.get('session')}]"
+            )
+    except Exception as e:
+        logger.error(f"Trading cycle error: {e}", exc_info=True)
+    finally:
+        _cycle_lock.release()
+
+
+# ── Background loop (keeps running between requests when instance is alive) ───
 def _bot_loop():
     while True:
-        try:
-            positions = feed.get_positions()
-
-            for pos in positions:
-                _manage_position(pos)
-
-            if risk.should_close_friday() and positions:
-                for pos in positions:
-                    _close_position(pos, reason="friday_close")
-                time.sleep(60)
-                continue
-
-            can_trade, _ = risk.can_trade()
-            if not can_trade or positions:
-                time.sleep(60)
-                continue
-
-            if news_filter.is_news_time()[0]:
-                time.sleep(60)
-                continue
-
-            if not (strategy.is_london_session() or strategy.is_ny_session()):
-                time.sleep(60)
-                continue
-
-            signal = strategy.get_signal(settings.symbol)
-            logger.info(f"Signal: {signal}")
-
-            if signal.get("direction") in ("BUY", "SELL"):
-                lot = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
-                trade = executor.execute_signal(signal, lot)
-                if trade:
-                    acct = feed.get_account_info()
-                    notifier.send_signal(signal, lot, acct.get("balance", 5000))
-                    logger.info(
-                        f"Trade | {signal['direction']} {lot} lots "
-                        f"@ ${signal['entry']:.2f} [{signal.get('session')}]"
-                    )
-        except Exception as e:
-            logger.error(f"Bot loop error: {e}", exc_info=True)
-
+        _run_trading_cycle()
         time.sleep(60)
 
 
@@ -232,6 +240,10 @@ def status():
     acct = feed.get_account_info()
     positions = feed.get_positions()
     daily_pnl = db.get_daily_pnl() if db.conn else 0.0
+
+    # Trigger trading logic inline — fires even when background thread is dead
+    threading.Thread(target=_run_trading_cycle, daemon=True).start()
+
     return jsonify({
         "symbol": "XAUUSD",
         "mode": "paper",
