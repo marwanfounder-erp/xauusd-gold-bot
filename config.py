@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     pip_value: float = 1.0             # $1 per pip per lot
     breakout_buffer_dollars: float = 0.20
     min_range_dollars: float = 8.0
-    max_range_dollars: float = 35.0
+    max_range_dollars: float = 100.0
 
     # Strategy
     rsi_period: int = 14
