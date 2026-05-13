@@ -21,7 +21,15 @@ LOG_BUFFER = deque(maxlen=500)
 
 class BufferHandler(logging.Handler):
     def emit(self, record):
-        LOG_BUFFER.append(self.format(record))
+        msg = self.format(record)
+        LOG_BUFFER.append(msg)
+        # Also persist to DB so logs survive across Vercel cold-starts.
+        # db may not be connected yet at import time; guard with hasattr.
+        try:
+            if "db" in globals() and db.conn:
+                db.save_log(msg)
+        except Exception:
+            pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -289,7 +297,13 @@ def equity():
 
 @app.route("/api/logs")
 def logs():
-    return jsonify({"lines": list(LOG_BUFFER)})
+    # Prefer DB logs — they survive across Vercel cold-starts / instances.
+    # Fall back to in-memory buffer if DB is unavailable.
+    if db.conn:
+        lines = db.get_logs(limit=100)
+    else:
+        lines = list(LOG_BUFFER)
+    return jsonify({"lines": lines})
 
 
 if __name__ == "__main__":

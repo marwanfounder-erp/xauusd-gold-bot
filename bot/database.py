@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS {prefix}paper_balance (
 );
 """
 
+CREATE_BOT_LOGS_SQL = """
+CREATE TABLE IF NOT EXISTS {prefix}bot_logs (
+    id          SERIAL PRIMARY KEY,
+    symbol      VARCHAR(10) NOT NULL DEFAULT 'XAUUSD',
+    message     TEXT NOT NULL,
+    logged_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS {prefix}bot_logs_symbol_idx ON {prefix}bot_logs (symbol, logged_at DESC);
+"""
+
 
 class Database:
     def __init__(self, config):
@@ -90,6 +100,7 @@ class Database:
             cur.execute(CREATE_TRADES_SQL.format(prefix=self.prefix))
             cur.execute(CREATE_EQUITY_SQL.format(prefix=self.prefix))
             cur.execute(CREATE_PAPER_BALANCE_SQL.format(prefix=self.prefix))
+            cur.execute(CREATE_BOT_LOGS_SQL.format(prefix=self.prefix))
 
     def save_trade(self, trade: dict) -> Optional[int]:
         if not self.conn:
@@ -280,6 +291,46 @@ class Database:
                 cur.execute(sql, {"symbol": symbol, "balance": balance})
         except Exception as e:
             logger.error(f"update_paper_balance error: {e}")
+
+    def save_log(self, message: str):
+        if not self.conn:
+            return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {self.prefix}bot_logs (symbol, message) VALUES (%s, %s)",
+                    (self.config.symbol, message),
+                )
+                # Keep only the last 500 rows per symbol to avoid unbounded growth
+                cur.execute(
+                    f"""
+                    DELETE FROM {self.prefix}bot_logs
+                    WHERE symbol=%s AND id NOT IN (
+                        SELECT id FROM {self.prefix}bot_logs
+                        WHERE symbol=%s ORDER BY logged_at DESC LIMIT 500
+                    )
+                    """,
+                    (self.config.symbol, self.config.symbol),
+                )
+        except Exception as e:
+            logger.error(f"save_log error: {e}")
+
+    def get_logs(self, limit: int = 100) -> list:
+        if not self.conn:
+            return []
+        sql = f"""
+            SELECT message FROM {self.prefix}bot_logs
+            WHERE symbol='{self.config.symbol}'
+            ORDER BY logged_at DESC LIMIT {limit}
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            return [r[0] for r in reversed(rows)]
+        except Exception as e:
+            logger.error(f"get_logs error: {e}")
+            return []
 
     def disconnect(self):
         if self.conn:
