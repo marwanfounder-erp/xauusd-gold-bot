@@ -1,5 +1,5 @@
 """
-Paper data feed — Finnhub primary (works on Vercel), yfinance local fallback.
+Paper data feed — yfinance primary, Finnhub fallback (free tier blocks OANDA:XAU_USD).
 """
 
 import logging
@@ -105,7 +105,10 @@ class PaperDataFeed:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get_tick(self, symbol: str) -> Optional[dict]:
-        # Try Finnhub first
+        # yfinance primary (works on Railway); Finnhub free tier blocks OANDA:XAU_USD
+        tick = self._yfinance_tick(symbol)
+        if tick:
+            return tick
         data = self._finnhub_get("quote", {"symbol": FINNHUB_SYMBOL})
         if data and data.get("c"):
             price = float(data["c"])
@@ -118,9 +121,8 @@ class PaperDataFeed:
                 "time": datetime.utcnow(),
                 "source": "finnhub",
             }
-        # Fall back to yfinance (works locally, not on Vercel)
-        logger.warning("Finnhub tick failed — trying yfinance fallback")
-        return self._yfinance_tick(symbol)
+        logger.warning("Both yfinance and Finnhub tick failed")
+        return None
 
     def get_candles(self, symbol: str, timeframe: str, count: int) -> Optional[pd.DataFrame]:
         resolution = FINNHUB_RESOLUTION.get(timeframe, "60")
@@ -130,6 +132,11 @@ class PaperDataFeed:
         secs = bar_seconds.get(resolution, 3600)
         to_ts = int(datetime.now(timezone.utc).timestamp())
         from_ts = to_ts - (secs * count * 2)  # fetch 2× to ensure enough bars
+
+        # yfinance primary (works on Railway); Finnhub free tier blocks OANDA:XAU_USD
+        yf_df = self._yfinance_candles(timeframe, count)
+        if yf_df is not None:
+            return yf_df
 
         data = self._finnhub_get(
             "forex/candle",
@@ -153,9 +160,8 @@ class PaperDataFeed:
             except Exception as e:
                 logger.warning(f"Finnhub candle parse error: {e}")
 
-        # Fall back to yfinance
-        logger.warning("Finnhub candles failed — trying yfinance fallback")
-        return self._yfinance_candles(timeframe, count)
+        logger.warning("Both yfinance and Finnhub candles failed")
+        return None
 
     def get_account_info(self) -> dict:
         balance = PAPER_STARTING_BALANCE
