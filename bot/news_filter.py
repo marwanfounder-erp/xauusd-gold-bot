@@ -26,6 +26,7 @@ class NewsFilter:
         self.config = config
         self._cache: list = []
         self._cache_date: Optional[date] = None
+        self._cache_fetched: bool = False  # True once fetched for _cache_date, even when 0 events
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
@@ -52,7 +53,8 @@ class NewsFilter:
 
     def fetch_news(self) -> list:
         today = date.today()
-        if self._cache_date == today and self._cache:
+        if self._cache_date == today and self._cache_fetched:
+            logger.debug(f"News cache hit: {len(self._cache)} events for {today}")
             return self._cache
 
         # Fetch today + tomorrow to catch events at day boundaries
@@ -93,7 +95,8 @@ class NewsFilter:
 
         self._cache = events
         self._cache_date = today
-        logger.info(f"Finnhub: {len(events)} gold-relevant events loaded for {today}")
+        self._cache_fetched = True
+        logger.info(f"Finnhub: fresh fetch — {len(events)} gold-relevant events for {today}")
         return events
 
     # ── Checks ────────────────────────────────────────────────────────────────
