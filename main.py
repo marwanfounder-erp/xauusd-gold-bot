@@ -316,11 +316,17 @@ def main():
     group.add_argument("--paper", action="store_true", help="Paper trading mode")
     group.add_argument("--live", action="store_true", help="Live MT5 trading")
     group.add_argument("--backtest", action="store_true", help="Run backtest")
+    parser.add_argument(
+        "--source",
+        choices=["alpaca", "yfinance"],
+        default=None,
+        help="Force backtest data source (alpaca | yfinance). Default: auto-detect.",
+    )
     args = parser.parse_args()
 
     if args.backtest:
         from backtest.backtest_engine import run_backtest
-        run_backtest()
+        run_backtest(source=args.source)
     elif args.paper:
         run_paper(args)
     elif args.live:

@@ -6,6 +6,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# NY-only RSI thresholds — London trading disabled per strategy update
+NY_RSI_BUY  = 65.0
+NY_RSI_SELL = 35.0
+
 
 class XAUUSDStrategy:
     def __init__(self, config, feed):
@@ -110,55 +114,16 @@ class XAUUSDStrategy:
         trend = self.get_trend_direction(symbol)
         buf = self.config.breakout_buffer_dollars
 
-        # ── LONDON SESSION ────────────────────────────────────────────────────
+        # ── LONDON SESSION — entries disabled, log range for context only ────
         if self.is_london_session():
             asian_range = self.calculate_asian_range(df)
-
-            if not asian_range:
-                return {"direction": "NONE", "reason": "no_asian_range"}
-
-            range_val = asian_range["range_dollars"]
-            logger.info(
-                f"Gold Asian range | high=${asian_range['high']:.2f} "
-                f"low=${asian_range['low']:.2f} range=${range_val:.2f} "
-                f"valid={asian_range['valid']}"
-            )
-
-            if not asian_range["valid"]:
-                return {"direction": "NONE", "reason": f"invalid_asian_range_${range_val:.2f}"}
-
-            buy_level = asian_range["high"] + buf
-            sell_level = asian_range["low"] - buf
-
-            if current_price > buy_level and rsi > self.config.rsi_buy_threshold and trend != "bearish":
-                sl = asian_range["low"] - buf
-                sl_distance = current_price - sl
-                tp = current_price + (sl_distance * self.config.rr_ratio)
-                return self._build_signal(
-                    direction="BUY",
-                    entry=current_price,
-                    sl=sl,
-                    tp=tp,
-                    rsi=rsi,
-                    trend=trend,
-                    session="LONDON",
-                    extra={"range_dollars": range_val},
+            if asian_range:
+                logger.info(
+                    f"Gold Asian range | high=${asian_range['high']:.2f} "
+                    f"low=${asian_range['low']:.2f} range=${asian_range['range_dollars']:.2f} "
+                    f"valid={asian_range['valid']}"
                 )
-
-            if current_price < sell_level and rsi < self.config.rsi_sell_threshold and trend != "bullish":
-                sl = asian_range["high"] + buf
-                sl_distance = sl - current_price
-                tp = current_price - (sl_distance * self.config.rr_ratio)
-                return self._build_signal(
-                    direction="SELL",
-                    entry=current_price,
-                    sl=sl,
-                    tp=tp,
-                    rsi=rsi,
-                    trend=trend,
-                    session="LONDON",
-                    extra={"range_dollars": range_val},
-                )
+            return {"direction": "NONE", "reason": "london_disabled"}
 
         # ── NY SESSION ────────────────────────────────────────────────────────
         elif self.is_ny_session():
@@ -170,7 +135,7 @@ class XAUUSDStrategy:
             ny_buy_level = london_range["high"] + buf
             ny_sell_level = london_range["low"] - buf
 
-            if current_price > ny_buy_level and rsi > self.config.rsi_buy_threshold and trend != "bearish":
+            if current_price > ny_buy_level and rsi > NY_RSI_BUY and trend != "bearish":
                 sl = london_range["low"] - buf
                 sl_distance = current_price - sl
                 tp = current_price + (sl_distance * self.config.rr_ratio)
@@ -185,7 +150,7 @@ class XAUUSDStrategy:
                     extra={},
                 )
 
-            if current_price < ny_sell_level and rsi < self.config.rsi_sell_threshold and trend != "bullish":
+            if current_price < ny_sell_level and rsi < NY_RSI_SELL and trend != "bullish":
                 sl = london_range["high"] + buf
                 sl_distance = sl - current_price
                 tp = current_price - (sl_distance * self.config.rr_ratio)
