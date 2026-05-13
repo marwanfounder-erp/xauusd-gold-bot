@@ -61,7 +61,16 @@ class Settings(BaseSettings):
     db_table_prefix: str = "gold_"
 
     # Dashboard — Railway injects PORT env var; fall back to 8081 locally
-    dashboard_port: int = int(os.environ.get("PORT", 8081))
+    dashboard_port: int = int(os.environ.get("PORT", "8081"))
+
+    @field_validator("dashboard_port", mode="before")
+    @classmethod
+    def _use_railway_port(cls, v):
+        """Always prefer Railway's PORT so the healthcheck can reach us."""
+        port_env = os.environ.get("PORT")
+        if port_env:
+            return int(port_env)
+        return v
 
     class Config:
         env_file = ".env"
