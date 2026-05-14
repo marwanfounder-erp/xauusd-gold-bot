@@ -4,7 +4,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-MONTHLY_LOSS_LIMIT = 0.03   # halt if monthly loss exceeds 3% of month-start balance
+MONTHLY_LOSS_LIMIT = 0.04   # halt if monthly loss exceeds 4% of month-start balance
 
 
 class RiskManager:

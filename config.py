@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     ny_session_end: int = 16
 
     # Risk / misc
+    monthly_loss_limit: float = 0.04    # 4% monthly circuit breaker
     friday_close_hour_utc: int = 21
     news_filter_before_minutes: int = 30
     news_filter_after_minutes: int = 60
@@ -55,6 +56,10 @@ class Settings(BaseSettings):
 
     # News — Finnhub
     finnhub_api_key: str = ""
+
+    # The5ers compliance
+    the5ers_mode: bool = True
+    the5ers_news_block_minutes: int = 2
 
     # Database
     database_url: str = ""
