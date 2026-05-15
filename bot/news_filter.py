@@ -136,6 +136,23 @@ class NewsFilter:
         )
         return events
 
+    # ── Window helpers ────────────────────────────────────────────────────────
+
+    def _get_window(self) -> tuple[timedelta, timedelta]:
+        """Return (before, after) timedeltas based on active mode."""
+        if getattr(self.config, "the5ers_mode", False):
+            mins = self.config.the5ers_news_block_minutes
+            return timedelta(minutes=mins), timedelta(minutes=mins)
+        return (
+            timedelta(minutes=self.config.news_filter_before_minutes),
+            timedelta(minutes=self.config.news_filter_after_minutes),
+        )
+
+    def _blocked_by_event(self, now: datetime, event: dict) -> bool:
+        before, after = self._get_window()
+        event_dt = event["event_time"]
+        return event_dt - before <= now <= event_dt + after
+
     # ── Single entry point for the main loop ──────────────────────────────────
 
     def check(self, hours_ahead: int = 4) -> tuple[bool, str, list]:
@@ -151,21 +168,26 @@ class NewsFilter:
         logger.info(f"News check: {len(events)} events cached for today")
 
         now    = datetime.utcnow()
-        before = timedelta(minutes=self.config.news_filter_before_minutes)
-        after  = timedelta(minutes=self.config.news_filter_after_minutes)
         cutoff = now + timedelta(hours=hours_ahead)
 
         # Upcoming events for dashboard (computed regardless of blocking)
         upcoming = [e for e in events if now <= e["event_time"] <= cutoff]
 
+        the5ers = getattr(self.config, "the5ers_mode", False)
+
         # Check if we are currently inside a news blackout window
         for event in events:
-            event_dt = event["event_time"]
-            if event_dt - before <= now <= event_dt + after:
-                block_msg = (
-                    f"{event['impact'].upper()} | {event['title']} "
-                    f"@ {event_dt.strftime('%H:%M UTC')}"
-                )
+            if self._blocked_by_event(now, event):
+                if the5ers:
+                    block_msg = (
+                        f"ORDER BLOCKED — within {self.config.the5ers_news_block_minutes}min "
+                        f"of news event: {event['title']}"
+                    )
+                else:
+                    block_msg = (
+                        f"{event['impact'].upper()} | {event['title']} "
+                        f"@ {event['event_time'].strftime('%H:%M UTC')}"
+                    )
                 logger.info(f"News block active: {block_msg}")
                 return True, block_msg, upcoming
 
@@ -175,17 +197,21 @@ class NewsFilter:
 
     def is_news_time(self) -> tuple[bool, str]:
         """Thin wrapper used by api/index.py. Hits the class-level cache."""
-        now    = datetime.utcnow()
-        before = timedelta(minutes=self.config.news_filter_before_minutes)
-        after  = timedelta(minutes=self.config.news_filter_after_minutes)
+        now = datetime.utcnow()
+        the5ers = getattr(self.config, "the5ers_mode", False)
         try:
             for event in self.fetch_news():
-                event_dt = event["event_time"]
-                if event_dt - before <= now <= event_dt + after:
-                    msg = (
-                        f"{event['impact'].upper()} | {event['title']} "
-                        f"@ {event_dt.strftime('%H:%M UTC')}"
-                    )
+                if self._blocked_by_event(now, event):
+                    if the5ers:
+                        msg = (
+                            f"ORDER BLOCKED — within {self.config.the5ers_news_block_minutes}min "
+                            f"of news event: {event['title']}"
+                        )
+                    else:
+                        msg = (
+                            f"{event['impact'].upper()} | {event['title']} "
+                            f"@ {event['event_time'].strftime('%H:%M UTC')}"
+                        )
                     logger.info(f"News block active: {msg}")
                     return True, msg
         except Exception as e:
