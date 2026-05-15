@@ -200,6 +200,19 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
 
             # ── Signal check ───────────────────────────────────────────────
             if not (strategy.is_london_session() or strategy.is_ny_session()):
+                h, m = now.hour, now.minute
+                if h < settings.london_session_start:
+                    mins = (settings.london_session_start - h) * 60 - m
+                    next_msg = f"London opens in {mins // 60}h {mins % 60}m"
+                elif h >= settings.london_session_end and h < settings.ny_session_start:
+                    mins = (settings.ny_session_start - h) * 60 - m
+                    next_msg = f"NY opens in {mins // 60}h {mins % 60}m"
+                else:
+                    next_msg = "London opens tomorrow at 07:00 UTC"
+                logger.info(
+                    f"Bot heartbeat | time={now.strftime('%H:%M')} UTC "
+                    f"session=WAITING | {next_msg}"
+                )
                 time.sleep(60)
                 continue
 

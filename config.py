@@ -31,8 +31,8 @@ class Settings(BaseSettings):
 
     # Strategy
     rsi_period: int = 14
-    rsi_buy_threshold: float = 60.0
-    rsi_sell_threshold: float = 40.0
+    rsi_buy_threshold: float = 65.0
+    rsi_sell_threshold: float = 35.0
     ema_period: int = 20
     rr_ratio: float = 2.0
 
