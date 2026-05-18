@@ -1,23 +1,18 @@
 """
-XAUUSD Backtest Engine
+Multi-Pair London Breakout Backtest Engine
 Run: python backtest/backtest_engine.py
      python main.py --backtest
 
-Strategy (v6):
+Strategy:
   - London session (07:00–10:00 UTC) — Asian range breakout
-      H4+Daily must BOTH agree (strictly bullish/bearish)
   - NY session     (13:00–16:00 UTC) — London range breakout
-      H4+Daily must BOTH agree (strictly bullish/bearish)
-  - Fixed $0.20 breakout buffer
-  - SL at opposite range boundary minus buffer
-  - Single TP at 2R
-  - Breakeven SL move at 50% to TP (via check_breakeven in live bot)
   - H4 + Daily EMA20 trend filter (both must agree)
-  - ATR computed and logged per-trade (not used for SL/entry)
-  - RSI 65/35 thresholds
-  - 1.0% risk per trade
+  - RSI 60/40 thresholds
+  - 0.5% risk per trade, 2R TP
+  - 4% monthly circuit breaker
 
-Data source: yfinance GC=F (Gold futures, 24/7, UTC-normalised)
+Pairs: XAUUSD, GBPUSD, USDJPY
+Data: yfinance
 """
 
 import sys
@@ -33,25 +28,18 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-SPREAD            = 0.20
-SLIPPAGE          = 0.10
-STARTING_BALANCE  = 10_000.0
-RISK_PER_TRADE    = 0.01           # 1.0%
-RR_RATIO          = 2.0
-RSI_PERIOD        = 14
-RSI_BUY           = 65.0
-RSI_SELL          = 35.0
-EMA_PERIOD        = 20
-ATR_PERIOD        = 14
-BREAKOUT_BUFFER    = 0.20           # fixed dollar buffer (not ATR-based)
-MONTHLY_LOSS_LIMIT = 0.04           # halt if monthly loss exceeds 4% of month-start balance
-MIN_RANGE         = 8.0
-MAX_RANGE         = 100.0
-PIP_SIZE          = 0.01
-PIP_VALUE         = 1.0            # $1 per pip per lot
-MAX_LOT           = 1.0
-MAX_TRADE_HOURS   = 20
+# ── Strategy constants ────────────────────────────────────────────────────────
+STARTING_BALANCE   = 10_000.0
+RISK_PER_TRADE     = 0.005          # 0.5%
+RR_RATIO           = 2.0
+RSI_BUY            = 60.0
+RSI_SELL           = 40.0
+EMA_PERIOD         = 20
+ATR_PERIOD         = 14
+RSI_PERIOD         = 14
+MONTHLY_LOSS_LIMIT = 0.04
+MAX_TRADE_HOURS    = 20
+SLIPPAGE_PCT       = 0.0001         # 0.01% slippage as fraction of price
 
 LONDON_START = 7
 LONDON_END   = 10
@@ -59,10 +47,69 @@ NY_START     = 13
 NY_END       = 16
 ASIAN_END    = 7
 
+# ── Per-pair configuration ────────────────────────────────────────────────────
+PAIR_CONFIGS = {
+    'XAUUSD': {
+        'pip_size':     0.01,
+        'pip_value':    1.0,
+        'min_range':    300,     # pips (= $3.00 min Asian range)
+        'max_range':    1500,    # pips (= $15.00 max Asian range)
+        'buffer':       20,      # pips (= $0.20 breakout buffer)
+        'spread':       30,      # pips (= $0.30 spread)
+        'yahoo_symbol': 'GC=F',
+        'max_lot':      1.0,
+        'price_dec':    2,
+    },
+    'GBPUSD': {
+        'pip_size':     0.0001,
+        'pip_value':    10.0,
+        'min_range':    15,      # pips
+        'max_range':    60,      # pips
+        'buffer':       2,       # pips
+        'spread':       1.5,     # pips
+        'yahoo_symbol': 'GBPUSD=X',
+        'max_lot':      1.0,
+        'price_dec':    5,
+    },
+    'USDJPY': {
+        'pip_size':     0.01,
+        'pip_value':    9.0,     # approx $9 per pip
+        'min_range':    15,      # pips
+        'max_range':    60,      # pips
+        'buffer':       2,       # pips
+        'spread':       1.5,     # pips
+        'yahoo_symbol': 'JPY=X',
+        'max_lot':      1.0,
+        'price_dec':    3,
+    },
+}
+
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 
 
 # ── Data download ─────────────────────────────────────────────────────────────
+
+def _download_yfinance(symbol: str, yahoo_sym: str) -> Optional[pd.DataFrame]:
+    print(f"  Trying yfinance {yahoo_sym} for {symbol}...")
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(yahoo_sym)
+        df     = ticker.history(period="2y", interval="1h")
+        if df.empty:
+            print(f"  yfinance {yahoo_sym}: empty response")
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        if df.index.tzinfo is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df = df[["open", "high", "low", "close", "volume"]].dropna()
+        df = df[~df.index.duplicated(keep="first")].sort_index()
+        print(f"  {symbol} OK: {len(df):,} bars "
+              f"({df.index[0].date()} → {df.index[-1].date()})")
+        return df
+    except Exception as e:
+        print(f"  yfinance {yahoo_sym} failed: {e}")
+        return None
+
 
 def _load_alpaca_keys() -> tuple[str, str]:
     api_key = os.environ.get("ALPACA_API_KEY", "")
@@ -88,149 +135,70 @@ def _load_alpaca_keys() -> tuple[str, str]:
     return api_key, secret
 
 
-def _alpaca_headers() -> dict:
-    api_key, secret = _load_alpaca_keys()
-    if not api_key:
-        print("  WARNING: ALPACA_API_KEY not set — Alpaca sources will be skipped")
-    return {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
-
-
-def _fetch_alpaca_pages(url: str, headers: dict, params: dict,
-                        bars_key: Optional[str] = None) -> list:
-    all_bars   = []
-    page_token = None
-    while True:
-        p = {**params}
-        if page_token:
-            p["page_token"] = page_token
-        resp = requests.get(url, headers=headers, params=p, timeout=30)
-        if resp.status_code == 401:
-            raise ValueError("Alpaca 401 — invalid API key")
-        if resp.status_code == 422:
-            raise ValueError(f"Alpaca 422 — bad params: {resp.text[:200]}")
-        if resp.status_code != 200:
-            raise ValueError(f"Alpaca HTTP {resp.status_code}: {resp.text[:200]}")
-        data       = resp.json()
-        bars       = data.get("bars", {}).get(bars_key, []) if bars_key else data.get("bars", [])
-        all_bars.extend(bars)
-        page_token = data.get("next_page_token")
-        if not page_token:
-            break
-    return all_bars
-
-
-def _bars_to_df(bars: list) -> pd.DataFrame:
-    df = pd.DataFrame(bars)
-    df["t"] = pd.to_datetime(df["t"], utc=True)
-    df = df.set_index("t")
-    df.index = df.index.tz_localize(None)
-    df = df.rename(columns={"o": "open", "h": "high", "l": "low",
-                             "c": "close", "v": "volume"})
-    needed = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
-    return df[needed].sort_index()
-
-
-def _download_alpaca_xauusd(headers: dict, start: str, end: str) -> Optional[pd.DataFrame]:
+def _download_alpaca_xauusd() -> Optional[pd.DataFrame]:
     print("  Trying Alpaca XAUUSD (forex v1beta3)...")
     try:
-        bars = _fetch_alpaca_pages(
-            f"{ALPACA_DATA_URL}/v1beta3/forex/bars",
-            headers,
-            {"symbols": "XAUUSD", "timeframe": "1Hour",
-             "start": start, "end": end, "limit": 1000, "sort": "asc"},
-            bars_key="XAUUSD",
-        )
-        if not bars:
-            print("  Alpaca XAUUSD: no bars returned")
+        api_key, secret = _load_alpaca_keys()
+        if not api_key:
+            print("  Alpaca: no API key")
             return None
-        df = _bars_to_df(bars)
-        print(f"  Alpaca XAUUSD OK: {len(df):,} bars "
-              f"({df.index[0].date()} → {df.index[-1].date()})")
+        headers  = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
+        end_dt   = datetime.utcnow()
+        start_dt = end_dt - timedelta(days=730)
+        params   = {
+            "symbols":   "XAUUSD", "timeframe": "1Hour",
+            "start":     start_dt.strftime("%Y-%m-%dT00:00:00Z"),
+            "end":       end_dt.strftime("%Y-%m-%dT00:00:00Z"),
+            "limit":     1000, "sort": "asc",
+        }
+        all_bars = []
+        page_token = None
+        while True:
+            p = {**params}
+            if page_token:
+                p["page_token"] = page_token
+            resp = requests.get(
+                f"{ALPACA_DATA_URL}/v1beta3/forex/bars",
+                headers=headers, params=p, timeout=30,
+            )
+            if resp.status_code != 200:
+                raise ValueError(f"Alpaca HTTP {resp.status_code}")
+            data       = resp.json()
+            bars       = data.get("bars", {}).get("XAUUSD", [])
+            all_bars.extend(bars)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        if not all_bars:
+            return None
+        df = pd.DataFrame(all_bars)
+        df["t"] = pd.to_datetime(df["t"], utc=True)
+        df = df.set_index("t")
+        df.index = df.index.tz_localize(None)
+        df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+        df = df[["open", "high", "low", "close", "volume"]].sort_index()
+        print(f"  Alpaca XAUUSD OK: {len(df):,} bars")
         return df
     except Exception as e:
         print(f"  Alpaca XAUUSD failed: {e}")
         return None
 
 
-def _download_alpaca_gld(headers: dict, start: str, end: str) -> Optional[pd.DataFrame]:
-    print("  Trying Alpaca GLD (Gold ETF — US hours only, scaled ×10)...")
-    print("  ⚠  GLD trades 09:30–16:00 ET only — Asian & London sessions will have no bars")
-    try:
-        bars = _fetch_alpaca_pages(
-            f"{ALPACA_DATA_URL}/v2/stocks/GLD/bars",
-            headers,
-            {"timeframe": "1Hour", "start": start, "end": end,
-             "limit": 1000, "adjustment": "raw", "sort": "asc"},
-        )
-        if not bars:
-            print("  Alpaca GLD: no bars returned")
-            return None
-        df = _bars_to_df(bars)
-        for col in ["open", "high", "low", "close"]:
-            df[col] = (df[col] * 10).round(2)
-        print(f"  Alpaca GLD (×10) OK: {len(df):,} bars "
-              f"({df.index[0].date()} → {df.index[-1].date()})")
-        return df
-    except Exception as e:
-        print(f"  Alpaca GLD failed: {e}")
-        return None
+def download_data(symbol: str, source: Optional[str] = None) -> tuple[pd.DataFrame, str]:
+    cfg      = PAIR_CONFIGS[symbol]
+    yahoo_sym = cfg['yahoo_symbol']
 
+    df = _download_yfinance(symbol, yahoo_sym)
+    if df is not None and len(df) > 100:
+        return df, f"yfinance {yahoo_sym}"
 
-def _download_yfinance() -> Optional[pd.DataFrame]:
-    print("  Trying yfinance GC=F (Gold futures, 24/7)...")
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker("GC=F")
-        df     = ticker.history(period="2y", interval="1h")
-        if df.empty:
-            print("  yfinance GC=F: empty response")
-            return None
-        df.columns = [c.lower() for c in df.columns]
-        # Convert to UTC before stripping timezone (yfinance uses America/New_York)
-        if df.index.tzinfo is not None:
-            df.index = df.index.tz_convert("UTC").tz_localize(None)
-        df = df[["open", "high", "low", "close", "volume"]].dropna()
-        df = df[~df.index.duplicated(keep="first")].sort_index()
-        print(f"  yfinance GC=F OK: {len(df):,} bars "
-              f"({df.index[0].date()} → {df.index[-1].date()})")
-        return df
-    except Exception as e:
-        print(f"  yfinance failed: {e}")
-        return None
-
-
-def download_data(source: Optional[str] = None) -> tuple[pd.DataFrame, str]:
-    """
-    Returns (dataframe, source_label).
-
-    source=None or "yfinance" — yfinance GC=F (default)
-    source="alpaca"           — Alpaca XAUUSD → Alpaca GLD only
-    """
-    if source in (None, "yfinance"):
-        df = _download_yfinance()
+    if symbol == "XAUUSD" and source != "yfinance":
+        df = _download_alpaca_xauusd()
         if df is not None and len(df) > 100:
-            return df, "yfinance GC=F (Gold futures, 24/7)"
-        if source == "yfinance":
-            raise ValueError("yfinance GC=F download failed")
+            return df, "Alpaca XAUUSD (forex)"
 
-    end_dt   = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=730)
-    start    = start_dt.strftime("%Y-%m-%dT00:00:00Z")
-    end      = end_dt.strftime("%Y-%m-%dT00:00:00Z")
-    headers  = _alpaca_headers()
-
-    df = _download_alpaca_xauusd(headers, start, end)
-    if df is not None and len(df) > 100:
-        return df, "Alpaca XAUUSD (forex)"
-
-    df = _download_alpaca_gld(headers, start, end)
-    if df is not None and len(df) > 100:
-        return df, "Alpaca GLD ×10 (US hours only — NY session only)"
-
-    if source == "alpaca":
-        raise ValueError("Alpaca sources failed and --source alpaca was specified")
-
-    raise ValueError("All data sources failed — cannot run backtest")
+    raise ValueError(f"All data sources failed for {symbol}")
 
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -257,12 +225,7 @@ def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
 
 
 def _build_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pre-compute H4 and Daily EMA20 values aligned to the H1 index.
-    Adds columns: h4_close, h4_ema20, d_close, d_ema20.
-    """
     df = df.copy()
-
     df_h4 = df.resample("4h", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"}
     ).dropna()
@@ -276,12 +239,10 @@ def _build_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
     df_d["ema20"] = df_d["close"].ewm(span=EMA_PERIOD).mean()
     df["d_close"] = df_d["close"].reindex(df.index, method="ffill")
     df["d_ema20"] = df_d["ema20"].reindex(df.index, method="ffill")
-
     return df
 
 
 def _trend_from_row(row) -> str:
-    """Derive H4+Daily trend from pre-computed columns in a single H1 row."""
     h4_c = row.get("h4_close")
     h4_e = row.get("h4_ema20")
     d_c  = row.get("d_close")
@@ -291,31 +252,34 @@ def _trend_from_row(row) -> str:
            for v in [h4_c, h4_e, d_c, d_e]):
         return "neutral"
 
-    h4_trend = ("bullish" if h4_c > h4_e * 1.001
-                else "bearish" if h4_c < h4_e * 0.999
-                else "neutral")
-    d_trend  = ("bullish" if d_c  > d_e  * 1.001
-                else "bearish" if d_c  < d_e  * 0.999
-                else "neutral")
+    h4_t = ("bullish" if h4_c > h4_e * 1.001 else
+             "bearish" if h4_c < h4_e * 0.999 else "neutral")
+    d_t  = ("bullish" if d_c  > d_e  * 1.001 else
+             "bearish" if d_c  < d_e  * 0.999 else "neutral")
 
-    if h4_trend == "bullish" and d_trend == "bullish":
+    if h4_t == "bullish" and d_t == "bullish":
         return "bullish"
-    if h4_trend == "bearish" and d_trend == "bearish":
+    if h4_t == "bearish" and d_t == "bearish":
         return "bearish"
     return "neutral"
 
 
 # ── Range helpers ─────────────────────────────────────────────────────────────
 
-def get_asian_range(day_df: pd.DataFrame) -> Optional[dict]:
+def get_asian_range(day_df: pd.DataFrame, pip_size: float,
+                    min_range: float, max_range: float) -> Optional[dict]:
     asian = day_df[day_df.index.hour < ASIAN_END]
     if len(asian) < 3:
         return None
-    high = float(asian["high"].max())
-    low  = float(asian["low"].min())
-    rng  = high - low
-    return {"high": high, "low": low, "range_dollars": rng,
-            "valid": MIN_RANGE <= rng <= MAX_RANGE}
+    high       = float(asian["high"].max())
+    low        = float(asian["low"].min())
+    range_pips = (high - low) / pip_size
+    return {
+        "high":       high,
+        "low":        low,
+        "range_pips": range_pips,
+        "valid":      min_range <= range_pips <= max_range,
+    }
 
 
 def get_london_range(day_df: pd.DataFrame) -> Optional[dict]:
@@ -328,44 +292,34 @@ def get_london_range(day_df: pd.DataFrame) -> Optional[dict]:
 
 # ── Lot size ──────────────────────────────────────────────────────────────────
 
-def calc_lot_size(balance: float, sl_dollars: float) -> float:
+def calc_lot_size(balance: float, sl_pips: float, pip_value: float,
+                  max_lot: float = 1.0) -> float:
     risk_amount = balance * RISK_PER_TRADE
-    sl_pips     = sl_dollars / PIP_SIZE
     if sl_pips <= 0:
         return 0.01
-    lot = risk_amount / (sl_pips * PIP_VALUE)
-    return round(max(0.01, min(lot, MAX_LOT)), 2)
+    lot = risk_amount / (sl_pips * pip_value)
+    return round(max(0.01, min(lot, max_lot)), 2)
 
 
-# ── Backtest core ─────────────────────────────────────────────────────────────
+# ── Single-pair backtest ──────────────────────────────────────────────────────
 
-def run_backtest(source: Optional[str] = None):
-    logging.basicConfig(level=logging.WARNING,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
-
-    W = 68
-    print("\n" + "═" * W)
-    print("  XAUUSD GOLD BOT — BACKTEST ENGINE  (v6)")
-    print("  London+NY  |  fixed $0.20 buffer  |  2R TP  |  H4+Daily trend  |  RSI 65/35  |  1% risk  |  4% CB")
-    print("═" * W)
-    print("\nFetching data...")
-
-    df, source_label = download_data(source)
-
-    print(f"\nData source : {source_label}")
-    print(f"Period      : {df.index[0].date()} → {df.index[-1].date()}")
-    print(f"Bars loaded : {len(df):,}")
-    print("\nComputing indicators...")
+def run_pair_backtest(symbol: str, df: pd.DataFrame) -> list[dict]:
+    """Run London+NY breakout strategy on one pair's H1 data. Returns trade list."""
+    cfg      = PAIR_CONFIGS[symbol]
+    pip_size = cfg['pip_size']
+    pip_val  = cfg['pip_value']
+    spread_p = cfg['spread'] * pip_size
+    buffer_p = cfg['buffer'] * pip_size
+    max_lot  = cfg['max_lot']
 
     df["rsi"]   = calc_rsi(df["close"])
     df["atr14"] = calc_atr(df)
-    df = _build_trend_columns(df)
+    df          = _build_trend_columns(df)
 
     balance    = STARTING_BALANCE
     trades: list[dict] = []
     open_trade: Optional[dict] = None
 
-    # Monthly circuit breaker state
     cb_month_key         = ""
     cb_monthly_loss      = 0.0
     cb_monthly_halted    = False
@@ -373,10 +327,8 @@ def run_backtest(source: Optional[str] = None):
     cb_halted_months: list[str] = []
 
     dates = df.index.normalize().unique()
-    print(f"Running backtest over {len(dates)} trading days...\n")
 
     for day in dates:
-        # ── Monthly CB rollover ────────────────────────────────────────────────
         day_key = day.strftime("%Y-%m")
         if day_key != cb_month_key:
             cb_month_key         = day_key
@@ -388,7 +340,7 @@ def run_backtest(source: Optional[str] = None):
         if len(day_df) < 5:
             continue
 
-        asian_range  = get_asian_range(day_df)
+        asian_range  = get_asian_range(day_df, pip_size, cfg['min_range'], cfg['max_range'])
         london_range = None
 
         for idx, row in day_df.iterrows():
@@ -397,7 +349,7 @@ def run_backtest(source: Optional[str] = None):
             rsi_val = float(row["rsi"])   if not pd.isna(row["rsi"])   else 50.0
             atr_val = float(row["atr14"]) if not pd.isna(row["atr14"]) else 0.0
 
-            # ── Manage open trade ──────────────────────────────────────────────
+            # ── Manage open trade ──────────────────────────────────────────
             if open_trade:
                 sl        = open_trade["sl"]
                 tp        = open_trade["tp"]
@@ -410,17 +362,17 @@ def run_backtest(source: Optional[str] = None):
                 if direction == "BUY":
                     if float(row["low"]) <= sl:
                         hit_sl   = True
-                        close_px = sl - SLIPPAGE
+                        close_px = sl - spread_p * 0.5
                     elif float(row["high"]) >= tp:
                         hit_tp   = True
-                        close_px = tp - SLIPPAGE
+                        close_px = tp - spread_p * 0.5
                 else:
                     if float(row["high"]) >= sl:
                         hit_sl   = True
-                        close_px = sl + SLIPPAGE
+                        close_px = sl + spread_p * 0.5
                     elif float(row["low"]) <= tp:
                         hit_tp   = True
-                        close_px = tp + SLIPPAGE
+                        close_px = tp + spread_p * 0.5
 
                 if hours_open >= MAX_TRADE_HOURS and not (hit_sl or hit_tp):
                     time_out = True
@@ -428,18 +380,19 @@ def run_backtest(source: Optional[str] = None):
 
                 if hit_sl or hit_tp or time_out:
                     entry = open_trade["entry"]
-                    pnl   = ((close_px - entry) if direction == "BUY"
-                             else (entry - close_px)) * lot * 100
-                    pnl     = round(pnl, 2)
+                    if direction == "BUY":
+                        pips = (close_px - entry) / pip_size
+                    else:
+                        pips = (entry - close_px) / pip_size
+                    pnl     = round(pips * pip_val * lot, 2)
                     balance += pnl
-                    # Monthly CB: accumulate loss and trigger halt if limit hit
                     if pnl < 0 and not cb_monthly_halted:
                         cb_monthly_loss += abs(pnl)
                         if cb_monthly_loss >= cb_monthly_start_bal * MONTHLY_LOSS_LIMIT:
                             cb_monthly_halted = True
                             cb_halted_months.append(cb_month_key)
                     open_trade.update({
-                        "close_price":   close_px,
+                        "close_price":   round(close_px, cfg['price_dec']),
                         "close_time":    idx,
                         "pnl":           pnl,
                         "close_reason":  "tp" if hit_tp else ("sl" if hit_sl else "timeout"),
@@ -452,46 +405,50 @@ def run_backtest(source: Optional[str] = None):
             if open_trade:
                 continue
 
-            # ── LONDON SESSION (07:00–10:00 UTC) — Asian range breakout ────────
+            # ── LONDON SESSION — Asian range breakout ──────────────────────
             if LONDON_START <= hour < LONDON_END:
-                if cb_monthly_halted:
-                    continue
-                if not asian_range or not asian_range["valid"]:
+                if cb_monthly_halted or not asian_range or not asian_range["valid"]:
                     continue
 
                 trend = _trend_from_row(row)
-                ask   = price + SPREAD / 2 + SLIPPAGE
-                bid   = price - SPREAD / 2 - SLIPPAGE
+                ask   = price + spread_p / 2
+                bid   = price - spread_p / 2
 
-                if ask > asian_range["high"] + BREAKOUT_BUFFER \
-                        and rsi_val > RSI_BUY and trend == "bullish":
+                if ask > asian_range["high"] + buffer_p and rsi_val > RSI_BUY and trend == "bullish":
                     entry   = ask
-                    sl      = asian_range["low"] - BREAKOUT_BUFFER
+                    sl      = asian_range["low"] - buffer_p
                     sl_dist = entry - sl
                     tp      = entry + sl_dist * RR_RATIO
-                    lot     = calc_lot_size(balance, sl_dist)
+                    sl_pips = sl_dist / pip_size
+                    lot     = calc_lot_size(balance, sl_pips, pip_val, max_lot)
                     open_trade = {
-                        "direction": "BUY",  "entry": entry, "sl": sl, "tp": tp,
+                        "symbol": symbol, "direction": "BUY",
+                        "entry": round(entry, cfg['price_dec']),
+                        "sl": round(sl, cfg['price_dec']),
+                        "tp": round(tp, cfg['price_dec']),
                         "lot": lot, "open_time": idx, "session": "LONDON",
-                        "rsi": round(rsi_val, 1), "atr": round(atr_val, 2),
-                        "range": round(asian_range["high"] - asian_range["low"], 2),
+                        "rsi": round(rsi_val, 1), "atr": round(atr_val, cfg['price_dec']),
+                        "range": round(asian_range["range_pips"], 1),
                     }
 
-                elif bid < asian_range["low"] - BREAKOUT_BUFFER \
-                        and rsi_val < RSI_SELL and trend == "bearish":
+                elif bid < asian_range["low"] - buffer_p and rsi_val < RSI_SELL and trend == "bearish":
                     entry   = bid
-                    sl      = asian_range["high"] + BREAKOUT_BUFFER
+                    sl      = asian_range["high"] + buffer_p
                     sl_dist = sl - entry
                     tp      = entry - sl_dist * RR_RATIO
-                    lot     = calc_lot_size(balance, sl_dist)
+                    sl_pips = sl_dist / pip_size
+                    lot     = calc_lot_size(balance, sl_pips, pip_val, max_lot)
                     open_trade = {
-                        "direction": "SELL", "entry": entry, "sl": sl, "tp": tp,
+                        "symbol": symbol, "direction": "SELL",
+                        "entry": round(entry, cfg['price_dec']),
+                        "sl": round(sl, cfg['price_dec']),
+                        "tp": round(tp, cfg['price_dec']),
                         "lot": lot, "open_time": idx, "session": "LONDON",
-                        "rsi": round(rsi_val, 1), "atr": round(atr_val, 2),
-                        "range": round(asian_range["high"] - asian_range["low"], 2),
+                        "rsi": round(rsi_val, 1), "atr": round(atr_val, cfg['price_dec']),
+                        "range": round(asian_range["range_pips"], 1),
                     }
 
-            # ── NY SESSION (13:00–16:00 UTC) — London range breakout ─────────────
+            # ── NY SESSION — London range breakout ─────────────────────────
             elif NY_START <= hour < NY_END:
                 if cb_monthly_halted:
                     continue
@@ -501,49 +458,57 @@ def run_backtest(source: Optional[str] = None):
                     continue
 
                 trend = _trend_from_row(row)
-                ask   = price + SPREAD / 2 + SLIPPAGE
-                bid   = price - SPREAD / 2 - SLIPPAGE
+                ask   = price + spread_p / 2
+                bid   = price - spread_p / 2
 
-                if ask > london_range["high"] + BREAKOUT_BUFFER \
-                        and rsi_val > RSI_BUY and trend == "bullish":
+                if ask > london_range["high"] + buffer_p and rsi_val > RSI_BUY and trend == "bullish":
                     entry   = ask
-                    sl      = london_range["low"] - BREAKOUT_BUFFER
+                    sl      = london_range["low"] - buffer_p
                     sl_dist = entry - sl
                     tp      = entry + sl_dist * RR_RATIO
-                    lot     = calc_lot_size(balance, sl_dist)
+                    sl_pips = sl_dist / pip_size
+                    lot     = calc_lot_size(balance, sl_pips, pip_val, max_lot)
                     open_trade = {
-                        "direction": "BUY", "entry": entry, "sl": sl, "tp": tp,
+                        "symbol": symbol, "direction": "BUY",
+                        "entry": round(entry, cfg['price_dec']),
+                        "sl": round(sl, cfg['price_dec']),
+                        "tp": round(tp, cfg['price_dec']),
                         "lot": lot, "open_time": idx, "session": "NY",
-                        "rsi": round(rsi_val, 1), "atr": round(atr_val, 2),
-                        "range": round(london_range["high"] - london_range["low"], 2),
+                        "rsi": round(rsi_val, 1), "atr": round(atr_val, cfg['price_dec']),
+                        "range": round((london_range["high"] - london_range["low"]) / pip_size, 1),
                     }
 
-                elif bid < london_range["low"] - BREAKOUT_BUFFER \
-                        and rsi_val < RSI_SELL and trend == "bearish":
+                elif bid < london_range["low"] - buffer_p and rsi_val < RSI_SELL and trend == "bearish":
                     entry   = bid
-                    sl      = london_range["high"] + BREAKOUT_BUFFER
+                    sl      = london_range["high"] + buffer_p
                     sl_dist = sl - entry
                     tp      = entry - sl_dist * RR_RATIO
-                    lot     = calc_lot_size(balance, sl_dist)
+                    sl_pips = sl_dist / pip_size
+                    lot     = calc_lot_size(balance, sl_pips, pip_val, max_lot)
                     open_trade = {
-                        "direction": "SELL", "entry": entry, "sl": sl, "tp": tp,
+                        "symbol": symbol, "direction": "SELL",
+                        "entry": round(entry, cfg['price_dec']),
+                        "sl": round(sl, cfg['price_dec']),
+                        "tp": round(tp, cfg['price_dec']),
                         "lot": lot, "open_time": idx, "session": "NY",
-                        "rsi": round(rsi_val, 1), "atr": round(atr_val, 2),
-                        "range": round(london_range["high"] - london_range["low"], 2),
+                        "rsi": round(rsi_val, 1), "atr": round(atr_val, cfg['price_dec']),
+                        "range": round((london_range["high"] - london_range["low"]) / pip_size, 1),
                     }
 
     # Close any trade still open at end of data
     if open_trade:
-        entry     = open_trade["entry"]
+        last_px = float(df["close"].iloc[-1])
+        entry   = open_trade["entry"]
+        lot     = open_trade["lot"]
         direction = open_trade["direction"]
-        lot       = open_trade["lot"]
-        last_px   = float(df["close"].iloc[-1])
-        pnl       = ((last_px - entry) if direction == "BUY"
-                     else (entry - last_px)) * lot * 100
-        pnl = round(pnl, 2)
+        if direction == "BUY":
+            pips = (last_px - entry) / pip_size
+        else:
+            pips = (entry - last_px) / pip_size
+        pnl = round(pips * pip_val * lot, 2)
         balance += pnl
         open_trade.update({
-            "close_price":   last_px,
+            "close_price":   round(last_px, cfg['price_dec']),
             "close_time":    df.index[-1],
             "pnl":           pnl,
             "close_reason":  "end_of_data",
@@ -551,37 +516,32 @@ def run_backtest(source: Optional[str] = None):
         })
         trades.append(open_trade)
 
-    _print_report(trades, STARTING_BALANCE, balance, df, source_label, cb_halted_months)
+    return trades
 
 
-# ── Stats helpers ─────────────────────────────────────────────────────────────
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 def _session_stats(trades: list, start_balance: float) -> dict:
-    total = len(trades)
-    if total == 0:
+    if not trades:
         return {"total": 0, "wr": 0.0, "pf": 0.0, "avg_win": 0.0,
                 "avg_loss": 0.0, "max_dd": 0.0, "net_pnl": 0.0, "net_pnl_pct": 0.0}
-
     wins         = [t for t in trades if t.get("pnl", 0) > 0]
     losses       = [t for t in trades if t.get("pnl", 0) <= 0]
     gross_profit = sum(t["pnl"] for t in wins)
     gross_loss   = abs(sum(t["pnl"] for t in losses))
     net_pnl      = sum(t.get("pnl", 0) for t in trades)
-
-    chron   = sorted(trades, key=lambda x: x.get("close_time", datetime.min))
-    peak    = start_balance
-    max_dd  = 0.0
-    running = start_balance
+    chron        = sorted(trades, key=lambda x: x.get("close_time", datetime.min))
+    peak = running = start_balance
+    max_dd = 0.0
     for t in chron:
         running += t.get("pnl", 0)
         if running > peak:
             peak = running
         if peak > 0:
             max_dd = max(max_dd, (peak - running) / peak)
-
     return {
-        "total":       total,
-        "wr":          len(wins) / total * 100,
+        "total":       len(trades),
+        "wr":          len(wins) / len(trades) * 100,
         "pf":          gross_profit / gross_loss if gross_loss > 0 else float("inf"),
         "avg_win":     gross_profit / len(wins)   if wins   else 0.0,
         "avg_loss":    gross_loss   / len(losses) if losses else 0.0,
@@ -591,179 +551,134 @@ def _session_stats(trades: list, start_balance: float) -> dict:
     }
 
 
-# ── Report ────────────────────────────────────────────────────────────────────
+def pf_str(v: float) -> str:
+    return f"{v:.2f}" if v != float("inf") else "∞"
 
-def _print_report(trades: list, start_balance: float, end_balance: float,
-                  df: pd.DataFrame, source: str,
-                  cb_halted_months: Optional[list] = None) -> dict:
+
+# ── Main backtest ─────────────────────────────────────────────────────────────
+
+def run_backtest(source: Optional[str] = None):
+    logging.basicConfig(level=logging.WARNING,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
     W = 74
+    print("\n" + "═" * W)
+    print("  MULTI-PAIR LONDON BREAKOUT BOT — BACKTEST ENGINE")
+    print("  XAUUSD · GBPUSD · USDJPY  |  London+NY  |  0.5% risk  |  2R TP  |  RSI 60/40")
+    print("═" * W)
 
-    if not trades:
-        print("No trades generated — check data source coverage and strategy parameters.")
-        return {}
+    symbols      = list(PAIR_CONFIGS.keys())
+    pair_trades  = {}
+    pair_sources = {}
+    all_trades   = []
 
-    london_trades = [t for t in trades if t.get("session") == "LONDON"]
-    ny_trades     = [t for t in trades if t.get("session") == "NY"]
+    for symbol in symbols:
+        print(f"\n{'─'*W}")
+        print(f"  Fetching data: {symbol}")
+        try:
+            df, src = download_data(symbol, source)
+            pair_sources[symbol] = src
+            print(f"  Running backtest for {symbol}...")
+            trades = run_pair_backtest(symbol, df)
+            pair_trades[symbol] = trades
+            all_trades.extend(trades)
+            stats = _session_stats(trades, STARTING_BALANCE)
+            print(
+                f"  {symbol}: {stats['total']} trades | "
+                f"WR={stats['wr']:.1f}% | "
+                f"MaxDD={stats['max_dd']:.1%} | "
+                f"Return={stats['net_pnl_pct']:+.1f}%"
+            )
+        except Exception as e:
+            print(f"  {symbol} FAILED: {e}")
+            pair_trades[symbol] = []
+            pair_sources[symbol] = "failed"
 
-    stats_all    = _session_stats(trades,        start_balance)
-    stats_london = _session_stats(london_trades, start_balance)
-    stats_ny     = _session_stats(ny_trades,     start_balance)
+    _print_combined_report(pair_trades, all_trades, pair_sources)
+    return pair_trades
 
-    # ── Monthly accumulators ──────────────────────────────────────────────────
-    def _accum(bucket: dict, t: dict) -> None:
+
+def _print_combined_report(pair_trades: dict, all_trades: list, pair_sources: dict):
+    W   = 74
+    SB  = STARTING_BALANCE
+
+    symbols = list(PAIR_CONFIGS.keys())
+    stats   = {sym: _session_stats(pair_trades.get(sym, []), SB) for sym in symbols}
+    stats_combined = _session_stats(all_trades, SB * len(symbols))
+
+    months_count = max(
+        len({t["close_time"].strftime("%Y-%m")
+             for sym in symbols for t in pair_trades.get(sym, [])
+             if t.get("close_time")}),
+        1
+    )
+
+    print("\n" + "═" * W)
+    print("  MULTI-PAIR BACKTEST RESULTS")
+    print("  London+NY  |  0.5% risk/trade  |  2R TP  |  H4+Daily EMA20  |  RSI 60/40")
+    print("═" * W)
+    for sym in symbols:
+        print(f"  {sym:<8} : {pair_sources.get(sym, '—')}")
+    print(f"  Starting balance : ${SB:,.2f} per pair  (${SB * len(symbols):,.2f} combined)")
+    print("─" * W)
+
+    # Per-pair table
+    hdr = f"  {'Pair':<10}{'Trades':>7}{'WinRate':>9}{'MaxDD':>8}{'NetPnL':>10}{'Return':>9}{'Avg/Mo':>8}"
+    print(hdr)
+    print("  " + "─" * (W - 2))
+
+    for sym in symbols:
+        s = stats[sym]
+        mo_avg = s['net_pnl_pct'] / months_count
+        end_bal = SB + s['net_pnl']
+        print(
+            f"  {sym:<10}{s['total']:>7}{s['wr']:>8.1f}%"
+            f"{s['max_dd']*100:>7.1f}%  ${s['net_pnl']:>+9,.2f}"
+            f"  {s['net_pnl_pct']:>+7.1f}%  {mo_avg:>+6.2f}%"
+        )
+
+    # Combined row
+    sc = stats_combined
+    mo_avg_c = sc['net_pnl_pct'] / months_count
+    print("  " + "─" * (W - 2))
+    print(
+        f"  {'COMBINED':<10}{sc['total']:>7}{sc['wr']:>8.1f}%"
+        f"{sc['max_dd']*100:>7.1f}%  ${sc['net_pnl']:>+9,.2f}"
+        f"  {sc['net_pnl_pct']:>+7.1f}%  {mo_avg_c:>+6.2f}%"
+    )
+
+    # Monthly breakdown (combined)
+    monthly: dict = {}
+    for t in all_trades:
         ct = t.get("close_time")
         if not ct:
-            return
+            continue
         key = ct.strftime("%Y-%m") if isinstance(ct, datetime) else str(ct)[:7]
-        bucket.setdefault(key, {"trades": 0, "wins": 0, "pnl": 0.0})
-        bucket[key]["trades"] += 1
+        monthly.setdefault(key, {"trades": 0, "wins": 0, "pnl": 0.0})
+        monthly[key]["trades"] += 1
         if t.get("pnl", 0) > 0:
-            bucket[key]["wins"] += 1
-        bucket[key]["pnl"] += t.get("pnl", 0)
+            monthly[key]["wins"] += 1
+        monthly[key]["pnl"] += t.get("pnl", 0)
 
-    monthly_all: dict    = {}
-    monthly_london: dict = {}
-    monthly_ny: dict     = {}
-    for t in trades:        _accum(monthly_all,    t)
-    for t in london_trades: _accum(monthly_london, t)
-    for t in ny_trades:     _accum(monthly_ny,     t)
+    if monthly:
+        print("─" * W)
+        print("  COMBINED MONTHLY BREAKDOWN")
+        print(f"  {'Month':<10}  {'P&L':>10}  {'Trades':>7}  {'WinRate':>8}")
+        print("  " + "─" * (W - 2))
+        for month in sorted(monthly):
+            m = monthly[month]
+            wr = m["wins"] / m["trades"] * 100 if m["trades"] > 0 else 0
+            print(f"  {month:<10}  {m['pnl']:>+10.2f}  {m['trades']:>7}  {wr:>7.1f}%")
 
-    months_count  = max(len(monthly_all), 1)
-    monthly_avg_a = stats_all["net_pnl_pct"]    / months_count
-    monthly_avg_l = stats_london["net_pnl_pct"] / months_count
-    monthly_avg_n = stats_ny["net_pnl_pct"]     / months_count
-
-    def _best_worst(monthly: dict) -> tuple[str, str]:
-        if not monthly:
-            return "—", "—"
-        best  = max(monthly.items(), key=lambda x: x[1]["pnl"])
-        worst = min(monthly.items(), key=lambda x: x[1]["pnl"])
-        return (f"{best[0]} {best[1]['pnl']:+.0f}",
-                f"{worst[0]} {worst[1]['pnl']:+.0f}")
-
-    best_a, worst_a = _best_worst(monthly_all)
-    best_l, worst_l = _best_worst(monthly_london)
-    best_n, worst_n = _best_worst(monthly_ny)
-
-    def pf_str(v: float) -> str:
-        return f"{v:.2f}" if v != float("inf") else "∞"
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    print("\n" + "═" * W)
-    print("  XAUUSD GOLD BOT — BACKTEST RESULTS  (v4: London + NY)")
-    print("  London+NY  |  fixed $0.20 buffer  |  2R TP  |  H4+Daily trend  |  1% risk")
+    # Verdict
     print("═" * W)
-    print(f"  Data source : {source}")
-    print(f"  Period      : {df.index[0].date()} → {df.index[-1].date()}")
-    print(f"  Bars        : {len(df):,}")
-    print(f"  Starting    : ${start_balance:,.2f}")
-    print(f"  Final       : ${end_balance:,.2f}")
-    print(f"  Assumptions : spread ${SPREAD:.2f}  |  slippage ${SLIPPAGE:.2f}  |  risk {RISK_PER_TRADE:.0%}/trade")
-    if cb_halted_months:
-        print(f"  CB Halted   : {len(cb_halted_months)} month(s) → {', '.join(cb_halted_months)}")
-    else:
-        print(f"  CB Halted   : none")
-    print("─" * W)
-
-    # ── 3-column results table ────────────────────────────────────────────────
-    MC, CC, LC, NC = 15, 20, 14, 12   # metric | combined | london | ny
-
-    def trow(label: str, vc: str, vl: str, vn: str) -> str:
-        return f"│ {label:<{MC-1}}│ {vc:<{CC-1}}│ {vl:<{LC-1}}│ {vn:<{NC-1}}│"
-
-    top    = f"┌{'─'*MC}┬{'─'*CC}┬{'─'*LC}┬{'─'*NC}┐"
-    hdr    = f"│{'Metric':^{MC}}│{'Combined':^{CC}}│{'London':^{LC}}│{'NY':^{NC}}│"
-    mid    = f"├{'─'*MC}┼{'─'*CC}┼{'─'*LC}┼{'─'*NC}┤"
-    bottom = f"└{'─'*MC}┴{'─'*CC}┴{'─'*LC}┴{'─'*NC}┘"
-
-    rows = [
-        ("Trades",
-         str(stats_all["total"]),
-         str(stats_london["total"]),
-         str(stats_ny["total"])),
-        ("Win Rate",
-         f"{stats_all['wr']:.1f}%",
-         f"{stats_london['wr']:.1f}%",
-         f"{stats_ny['wr']:.1f}%"),
-        ("Profit Factor",
-         pf_str(stats_all["pf"]),
-         pf_str(stats_london["pf"]),
-         pf_str(stats_ny["pf"])),
-        ("Avg Win $",
-         f"${stats_all['avg_win']:.2f}",
-         f"${stats_london['avg_win']:.2f}",
-         f"${stats_ny['avg_win']:.2f}"),
-        ("Avg Loss $",
-         f"${stats_all['avg_loss']:.2f}",
-         f"${stats_london['avg_loss']:.2f}",
-         f"${stats_ny['avg_loss']:.2f}"),
-        ("Max Drawdown",
-         f"{stats_all['max_dd']:.1%}",
-         f"{stats_london['max_dd']:.1%}",
-         f"{stats_ny['max_dd']:.1%}"),
-        ("Net P&L",
-         f"{stats_all['net_pnl_pct']:+.1f}% (${stats_all['net_pnl']:+,.0f})",
-         f"{stats_london['net_pnl_pct']:+.1f}%",
-         f"{stats_ny['net_pnl_pct']:+.1f}%"),
-        ("Monthly Avg",
-         f"{monthly_avg_a:+.2f}%",
-         f"{monthly_avg_l:+.2f}%",
-         f"{monthly_avg_n:+.2f}%"),
-        ("Best Month",  best_a,  best_l,  best_n),
-        ("Worst Month", worst_a, worst_l, worst_n),
-    ]
-
-    print(top)
-    print(hdr)
-    print(mid)
-    for label, vc, vl, vn in rows:
-        print(trow(label, vc, vl, vn))
-    print(bottom)
-
-    # ── Monthly breakdown ─────────────────────────────────────────────────────
-    all_months  = sorted(set(list(monthly_all.keys()) +
-                             list(monthly_london.keys()) +
-                             list(monthly_ny.keys())))
-    print("─" * W)
-    print("  MONTHLY BREAKDOWN  (24 months)")
-    print(f"  {'Month':<10}  {'Combined':>10}  {'London':>10}  {'NY':>10}  "
-          f"{'Trades':>7}  {'Balance':>12}")
-    print("  " + "─" * (W - 2))
-    running_bal = start_balance
-    for month in all_months:
-        ma = monthly_all.get(month,    {"trades": 0, "wins": 0, "pnl": 0.0})
-        ml = monthly_london.get(month, {"trades": 0, "wins": 0, "pnl": 0.0})
-        mn = monthly_ny.get(month,     {"trades": 0, "wins": 0, "pnl": 0.0})
-        running_bal += ma["pnl"]
-        print(f"  {month:<10}  {ma['pnl']:>+10.2f}  {ml['pnl']:>+10.2f}  "
-              f"{mn['pnl']:>+10.2f}  {ma['trades']:>7}  ${running_bal:>11,.2f}")
-
-    # ── London verdict ────────────────────────────────────────────────────────
-    print("═" * W)
-    combined_dd = stats_all["max_dd"]
-    wr_ok       = stats_all["wr"]  >= 45.0
-    dd_ok       = combined_dd      <= 0.08
-
-    print(f"\n  Combined DD : {combined_dd:.1%}  (threshold ≤8.0%)")
-    print(f"  Win Rate    : {stats_all['wr']:.1f}%  (threshold ≥45%)")
-
-    if dd_ok:
-        print("  London      : ENABLED ✓  Combined DD within safe limit")
-    else:
-        print(f"  London      : DISABLED ✗  Combined DD {combined_dd:.1%} exceeds 8%")
-        print("                → Revert London session block in bot/strategy.py to disabled")
-
-    passed  = wr_ok and dd_ok
-    verdict = ("PASS ✓  Safe to run both sessions"
-               if passed else
-               "REVIEW ✗  Check parameters or disable London")
-    print(f"\n  Verdict     : {verdict}")
+    wr_ok = sc["wr"] >= 45.0
+    dd_ok = sc["max_dd"] <= 0.08
+    print(f"\n  Combined DD  : {sc['max_dd']:.1%}  (threshold ≤8.0%)")
+    print(f"  Win Rate     : {sc['wr']:.1f}%  (threshold ≥45%)")
+    verdict = "PASS ✓  Safe to deploy" if (wr_ok and dd_ok) else "REVIEW ✗  Check parameters"
+    print(f"  Verdict      : {verdict}")
     print("═" * W + "\n")
-
-    return {
-        "stats": stats_all, "monthly": monthly_all,
-        "stats_london": stats_london, "stats_ny": stats_ny,
-    }
 
 
 if __name__ == "__main__":

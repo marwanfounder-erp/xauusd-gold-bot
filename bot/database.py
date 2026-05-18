@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS {prefix}trades (
 CREATE_EQUITY_SQL = """
 CREATE TABLE IF NOT EXISTS {prefix}equity (
     id          SERIAL PRIMARY KEY,
-    symbol      VARCHAR(10) NOT NULL DEFAULT 'XAUUSD',
+    symbol      VARCHAR(10) NOT NULL DEFAULT 'BOT',
     balance     FLOAT,
     equity      FLOAT,
     drawdown    FLOAT,
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS {prefix}paper_balance (
 CREATE_BOT_LOGS_SQL = """
 CREATE TABLE IF NOT EXISTS {prefix}bot_logs (
     id          SERIAL PRIMARY KEY,
-    symbol      VARCHAR(10) NOT NULL DEFAULT 'XAUUSD',
+    symbol      VARCHAR(10) NOT NULL DEFAULT 'BOT',
     message     TEXT NOT NULL,
     logged_at   TIMESTAMPTZ DEFAULT NOW()
 );
@@ -124,9 +124,11 @@ class Database:
             logger.error(f"save_trade error: {e}")
             return None
 
-    def close_trade(self, ticket: int, close_price: float, pnl: float, reason: str):
+    def close_trade(self, ticket: int, close_price: float, pnl: float, reason: str,
+                    symbol: str = None):
         if not self.conn:
             return
+        sym = symbol or self.config.symbol
         sql = f"""
             UPDATE {self.prefix}trades
             SET close_price=%(close_price)s, pnl=%(pnl)s,
@@ -137,21 +139,25 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute(sql, {
                     "close_price": close_price,
-                    "pnl": pnl,
-                    "reason": reason,
-                    "close_time": datetime.utcnow(),
-                    "ticket": ticket,
-                    "symbol": self.config.symbol,
+                    "pnl":         pnl,
+                    "reason":      reason,
+                    "close_time":  datetime.utcnow(),
+                    "ticket":      ticket,
+                    "symbol":      sym,
                 })
         except Exception as e:
             logger.error(f"close_trade error: {e}")
 
-    def get_trades(self, limit: int = 100, status: str = None) -> list:
+    def get_trades(self, limit: int = 100, status: str = None,
+                   symbol: str = None) -> list:
         if not self.conn:
             return []
-        where = f"WHERE symbol='{self.config.symbol}'"
+        where_parts = []
+        if symbol:
+            where_parts.append(f"symbol='{symbol}'")
         if status:
-            where += f" AND status='{status}'"
+            where_parts.append(f"status='{status}'")
+        where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
         sql = f"""
             SELECT id, symbol, direction, lot_size, entry_price, stop_loss, take_profit,
                    close_price, pnl, session, confidence, status, open_time, close_time,
@@ -168,14 +174,66 @@ class Database:
             logger.error(f"get_trades error: {e}")
             return []
 
+    def get_open_trades(self) -> list:
+        """All open trades across all pairs."""
+        return self.get_trades(limit=20, status="open")
+
+    def get_open_trades_by_symbol(self, symbol: str) -> list:
+        if not self.conn:
+            return []
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT * FROM {self.prefix}trades
+                    WHERE status = 'open' AND symbol = %s
+                    ORDER BY open_time DESC
+                    """,
+                    (symbol,)
+                )
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_open_trades_by_symbol error: {e}")
+            return []
+
+    def get_pair_stats(self, symbol: str) -> dict:
+        """Win rate and total PnL for a given symbol."""
+        if not self.conn:
+            return {"trades": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) as total,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                           COALESCE(SUM(pnl), 0) as pnl
+                    FROM {self.prefix}trades
+                    WHERE symbol=%s AND status='closed'
+                    """,
+                    (symbol,)
+                )
+                row = cur.fetchone()
+                total = int(row[0]) if row and row[0] else 0
+                wins  = int(row[1]) if row and row[1] else 0
+                pnl   = float(row[2]) if row and row[2] else 0.0
+                return {
+                    "trades":   total,
+                    "wins":     wins,
+                    "pnl":      round(pnl, 2),
+                    "win_rate": round(wins / total * 100, 1) if total > 0 else 0.0,
+                }
+        except Exception as e:
+            logger.error(f"get_pair_stats error: {e}")
+            return {"trades": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0}
+
     def get_daily_pnl(self, day: date = None) -> float:
+        """Total daily PnL across all pairs."""
         if not self.conn:
             return 0.0
         day = day or date.today()
         sql = f"""
             SELECT COALESCE(SUM(pnl), 0.0) FROM {self.prefix}trades
-            WHERE symbol='{self.config.symbol}'
-              AND status='closed'
+            WHERE status='closed'
               AND DATE(close_time) = '{day}'
         """
         try:
@@ -192,7 +250,7 @@ class Database:
             return
         sql = f"""
             INSERT INTO {self.prefix}equity (symbol, balance, equity, drawdown)
-            VALUES ('{self.config.symbol}', {balance}, {equity}, {drawdown})
+            VALUES ('BOT', {balance}, {equity}, {drawdown})
         """
         try:
             with self.conn.cursor() as cur:
@@ -206,7 +264,7 @@ class Database:
         sql = f"""
             SELECT balance, equity, drawdown, recorded_at
             FROM {self.prefix}equity
-            WHERE symbol='{self.config.symbol}'
+            WHERE symbol='BOT'
             ORDER BY recorded_at DESC LIMIT {limit}
         """
         try:
@@ -218,14 +276,14 @@ class Database:
             return []
 
     def get_open_positions(self) -> list:
-        """Load open paper positions so they survive Vercel restarts."""
+        """Load ALL open paper positions (all symbols) to survive restarts."""
         if not self.conn:
             return []
         sql = f"""
-            SELECT ticket, direction, lot_size, entry_price, stop_loss, take_profit,
+            SELECT ticket, symbol, direction, lot_size, entry_price, stop_loss, take_profit,
                    open_time, session
             FROM {self.prefix}trades
-            WHERE symbol='{self.config.symbol}' AND status='open' AND mode='paper'
+            WHERE status='open' AND mode='paper'
             ORDER BY open_time ASC
         """
         try:
@@ -235,17 +293,17 @@ class Database:
             result = []
             for r in rows:
                 result.append({
-                    "ticket": r["ticket"],
-                    "symbol": self.config.symbol,
-                    "type": r["direction"],
-                    "volume": r["lot_size"],
-                    "price_open": r["entry_price"],
-                    "sl": r["stop_loss"],
-                    "tp": r["take_profit"],
-                    "profit": 0.0,
-                    "unrealized_profit": 0.0,
-                    "time": r["open_time"].replace(tzinfo=None) if r["open_time"] else None,
-                    "session": r["session"],
+                    "ticket":           r["ticket"],
+                    "symbol":           r["symbol"],
+                    "type":             r["direction"],
+                    "volume":           r["lot_size"],
+                    "price_open":       r["entry_price"],
+                    "sl":               r["stop_loss"],
+                    "tp":               r["take_profit"],
+                    "profit":           0.0,
+                    "unrealized_profit":0.0,
+                    "time":             r["open_time"].replace(tzinfo=None) if r["open_time"] else None,
+                    "session":          r["session"],
                 })
             return result
         except Exception as e:
@@ -299,18 +357,16 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute(
                     f"INSERT INTO {self.prefix}bot_logs (symbol, message) VALUES (%s, %s)",
-                    (self.config.symbol, message),
+                    ("BOT", message),
                 )
-                # Keep only the last 500 rows per symbol to avoid unbounded growth
                 cur.execute(
                     f"""
                     DELETE FROM {self.prefix}bot_logs
-                    WHERE symbol=%s AND id NOT IN (
+                    WHERE symbol='BOT' AND id NOT IN (
                         SELECT id FROM {self.prefix}bot_logs
-                        WHERE symbol=%s ORDER BY logged_at DESC LIMIT 500
+                        WHERE symbol='BOT' ORDER BY logged_at DESC LIMIT 500
                     )
                     """,
-                    (self.config.symbol, self.config.symbol),
                 )
         except Exception as e:
             logger.error(f"save_log error: {e}")
@@ -320,7 +376,7 @@ class Database:
             return []
         sql = f"""
             SELECT message FROM {self.prefix}bot_logs
-            WHERE symbol='{self.config.symbol}'
+            WHERE symbol='BOT'
             ORDER BY logged_at DESC LIMIT {limit}
         """
         try:

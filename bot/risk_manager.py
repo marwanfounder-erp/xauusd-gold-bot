@@ -12,21 +12,17 @@ class RiskManager:
         self.config   = config
         self.feed     = feed
         self.db       = db
-        self.notifier = notifier   # optional: object with send_alert(str) or send_message(str)
+        self.notifier = notifier
 
         self._daily_loss          = 0.0
         self._daily_reset_date: Optional[date] = None
         self._starting_balance: Optional[float] = None
 
-        # Monthly circuit breaker
         self._monthly_loss         = 0.0
         self._monthly_halted       = False
-        self._cb_month_key: str    = ""   # "YYYY-MM" of the current tracked month
+        self._cb_month_key: str    = ""
         self._monthly_start_bal: Optional[float] = None
 
-        # Tracks which tickets have already had their 50% partial close executed.
-        # Keyed by ticket id; value = True once partial close is done.
-        # Resets on process restart — persisting this to DB is a future enhancement.
         self._partial_closed: dict = {}
 
     # ── Equity / balance ─────────────────────────────────────────────────────
@@ -43,22 +39,23 @@ class RiskManager:
             return info.get("balance", 5000.0)
         return 5000.0
 
-    # ── Lot size (Gold-specific) ──────────────────────────────────────────────
+    # ── Lot size (multi-pair) ─────────────────────────────────────────────────
 
-    def calculate_lot_size(self, symbol: str, sl_dollars: float) -> float:
+    def calculate_lot_size(self, symbol: str, sl_pips: float) -> float:
         """
-        Gold lot sizing:
-          pip = $0.01, pip_value = $1 per lot per pip
-          lot = risk_amount / (sl_pips * pip_value)
+        Universal lot sizing using per-pair pip_value.
+          lot = risk_amount / (sl_pips × pip_value)
         """
         try:
+            from config import PAIR_SETTINGS
+            pair      = PAIR_SETTINGS.get(symbol, {})
+            pip_value = pair.get('pip_value', 10.0)
+
             balance     = self.get_equity()
             risk_amount = balance * self.config.risk_per_trade
-            sl_pips     = sl_dollars / self.config.pip_size
-            pip_value   = self.config.pip_value  # $1 per pip per lot
 
             if sl_pips <= 0:
-                logger.warning("SL pips is zero/negative — defaulting to 0.01 lot")
+                logger.warning(f"{symbol} SL pips is zero/negative — defaulting to 0.01 lot")
                 return 0.01
 
             lot_size = risk_amount / (sl_pips * pip_value)
@@ -66,13 +63,13 @@ class RiskManager:
             lot_size = max(0.01, min(lot_size, self.config.max_lot_size))
 
             logger.info(
-                f"Gold lot size | balance=${balance:.2f} risk=${risk_amount:.2f} "
-                f"sl=${sl_dollars:.2f} sl_pips={sl_pips:.0f} lots={lot_size}"
+                f"{symbol} lot size | balance=${balance:.2f} risk=${risk_amount:.2f} "
+                f"sl_pips={sl_pips:.1f} pip_val=${pip_value} lots={lot_size}"
             )
             return lot_size
 
         except Exception as e:
-            logger.error(f"Lot size calc error: {e}")
+            logger.error(f"Lot size calc error ({symbol}): {e}")
             return 0.01
 
     # ── Daily loss tracking ───────────────────────────────────────────────────
@@ -110,13 +107,12 @@ class RiskManager:
         if self.notifier is None:
             return
         now = datetime.utcnow()
-        # Compute next month label for the message
         if now.month == 12:
             next_month = f"{now.year + 1}-01"
         else:
             next_month = f"{now.year}-{now.month + 1:02d}"
         msg = (
-            f"⚠️ XAUUSD Bot — Monthly Loss Limit Hit\n"
+            f"⚠️ Multi-Pair Bot — Monthly Loss Limit Hit\n"
             f"Monthly loss exceeded {MONTHLY_LOSS_LIMIT:.0%} of balance.\n"
             f"Trading halted until {next_month}."
         )
@@ -126,9 +122,7 @@ class RiskManager:
             elif hasattr(self.notifier, "send_message"):
                 self.notifier.send_message(msg)
         except Exception as e:
-            logger.error(f"Failed to send monthly halt Telegram alert: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────────
+            logger.error(f"Failed to send monthly halt alert: {e}")
 
     def record_trade_result(self, pnl: float):
         self._reset_daily_if_needed()
@@ -172,7 +166,7 @@ class RiskManager:
             return False, f"monthly_loss_limit_hit ({self.get_monthly_loss_pct():.1%})"
 
         positions = self.feed.get_positions()
-        if len(positions) >= self.config.max_open_positions:
+        if len(positions) >= self.config.max_total_positions:
             return False, f"max_positions_reached ({len(positions)})"
 
         daily_pct = self.get_daily_loss_pct()
@@ -190,27 +184,30 @@ class RiskManager:
         return now.weekday() == 4 and now.hour >= self.config.friday_close_hour_utc
 
     def check_breakeven(self, position: dict) -> Optional[float]:
-        """Return new SL price if position should be moved to breakeven, else None."""
-        entry     = position["price_open"]
-        tp        = position["tp"]
-        direction = position["type"]
+        entry      = position["price_open"]
+        tp         = position["tp"]
+        direction  = position["type"]
         current_sl = position["sl"]
+        symbol     = position.get("symbol", self.config.symbol)
+
+        from config import PAIR_SETTINGS
+        pip_size = PAIR_SETTINGS.get(symbol, {}).get('pip_size', self.config.pip_size)
 
         trigger_ratio = self.config.breakeven_trigger_ratio
         tp_distance   = abs(tp - entry)
 
         if direction == "BUY":
             trigger_price = entry + (tp_distance * trigger_ratio)
-            tick = self.feed.get_tick(position["symbol"])
+            tick = self.feed.get_tick(symbol)
             if tick and tick["bid"] >= trigger_price:
-                new_sl = entry + self.config.pip_size
+                new_sl = entry + pip_size
                 if current_sl < new_sl:
                     return new_sl
         else:
             trigger_price = entry - (tp_distance * trigger_ratio)
-            tick = self.feed.get_tick(position["symbol"])
+            tick = self.feed.get_tick(symbol)
             if tick and tick["ask"] <= trigger_price:
-                new_sl = entry - self.config.pip_size
+                new_sl = entry - pip_size
                 if current_sl > new_sl:
                     return new_sl
 
@@ -226,25 +223,6 @@ class RiskManager:
     # ── Partial TP monitor ────────────────────────────────────────────────────
 
     def monitor_positions(self) -> list[dict]:
-        """
-        Check open positions for partial TP events and return a list of actions
-        for the main loop to execute. Does NOT call feed methods directly so it
-        remains compatible with any broker adapter.
-
-        Each returned action dict:
-          action="partial_close" → close lots_to_close, then modify_position(new_sl, new_tp)
-          action="full_tp"       → position closed naturally; clean up internal state
-
-        DB columns to record on partial close (requires database.py update):
-          partial_closed (bool), partial_close_price (float)
-
-        Integration in main loop:
-          for action in risk_manager.monitor_positions():
-              if action["action"] == "partial_close":
-                  feed.close_partial(action["ticket"], action["lots_to_close"])
-                  feed.modify_position(action["ticket"],
-                                       sl=action["new_sl"], tp=action["new_tp"])
-        """
         actions   = []
         positions = self.feed.get_positions()
 
@@ -258,11 +236,12 @@ class RiskManager:
             tp1       = pos.get("tp1")
             tp2       = pos.get("tp") or pos.get("tp2")
             lot       = pos.get("volume", 0.01)
+            symbol    = pos.get("symbol", self.config.symbol)
 
             if tp1 is None:
                 continue
 
-            tick = self.feed.get_tick(pos.get("symbol", ""))
+            tick = self.feed.get_tick(symbol)
             if not tick:
                 continue
 
@@ -273,16 +252,17 @@ class RiskManager:
                           (direction == "SELL" and tick["ask"] <= tp1)
 
                 if hit_tp1:
+                    from config import PAIR_SETTINGS
+                    pip_size = PAIR_SETTINGS.get(symbol, {}).get('pip_size', self.config.pip_size)
                     half_lot = round(lot / 2, 2)
                     be_sl    = round(
-                        entry + self.config.pip_size if direction == "BUY"
-                        else entry - self.config.pip_size, 2
+                        entry + pip_size if direction == "BUY"
+                        else entry - pip_size, 5
                     )
                     self._partial_closed[ticket] = True
                     logger.info(
-                        f"Partial TP hit — moved SL to breakeven | "
-                        f"ticket={ticket} dir={direction} tp1={tp1:.2f} "
-                        f"lots_to_close={half_lot} new_sl={be_sl:.2f}"
+                        f"Partial TP hit | {symbol} ticket={ticket} dir={direction} "
+                        f"tp1={tp1} lots_to_close={half_lot} new_sl={be_sl}"
                     )
                     actions.append({
                         "action":        "partial_close",
@@ -292,27 +272,15 @@ class RiskManager:
                         "new_sl":        be_sl,
                         "new_tp":        tp2,
                     })
-
             else:
-                # Second half: check if tp2 was hit (position may already be closed
-                # by the broker — clean up our tracking state if ticket disappears)
                 hit_tp2 = (direction == "BUY"  and tick["bid"] >= tp2) or \
                           (direction == "SELL" and tick["ask"] <= tp2)
                 if hit_tp2:
                     self._partial_closed.pop(ticket, None)
-                    logger.info(
-                        f"Full TP hit | ticket={ticket} dir={direction} tp2={tp2:.2f}"
-                    )
-                    actions.append({
-                        "action":      "full_tp",
-                        "ticket":      ticket,
-                        "close_price": tp2,
-                    })
+                    actions.append({"action": "full_tp", "ticket": ticket, "close_price": tp2})
 
-        # Clean up tracking for tickets that are no longer open
         open_tickets = {pos.get("ticket") or pos.get("id") for pos in positions}
-        stale = [t for t in self._partial_closed if t not in open_tickets]
-        for t in stale:
+        for t in [k for k in self._partial_closed if k not in open_tickets]:
             self._partial_closed.pop(t, None)
 
         return actions

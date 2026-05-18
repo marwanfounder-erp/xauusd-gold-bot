@@ -8,9 +8,21 @@ logger = logging.getLogger(__name__)
 
 
 class XAUUSDStrategy:
+    """London + NY Breakout Strategy — works for XAUUSD, GBPUSD, USDJPY."""
+
     def __init__(self, config, feed):
         self.config = config
         self.feed = feed
+
+    # ── Pair helpers ─────────────────────────────────────────────────────────
+
+    def get_pair_settings(self, symbol: str) -> dict:
+        from config import PAIR_SETTINGS
+        return PAIR_SETTINGS.get(symbol, {
+            'pip_size': 0.01, 'pip_value': 1.0,
+            'min_range': 300, 'max_range': 1500, 'buffer': 20,
+            'yahoo_symbol': symbol, 'spread': 30,
+        })
 
     # ── Session helpers ──────────────────────────────────────────────────────
 
@@ -46,7 +58,6 @@ class XAUUSDStrategy:
         return round(float(rsi.iloc[-1]), 2)
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Average True Range — logged on every signal check for volatility context."""
         high  = df["high"]
         low   = df["low"]
         close = df["close"].shift(1)
@@ -54,21 +65,16 @@ class XAUUSDStrategy:
             [high - low, (high - close).abs(), (low - close).abs()], axis=1
         ).max(axis=1)
         atr = tr.ewm(span=period, min_periods=period).mean()
-        return round(float(atr.iloc[-1]), 2)
+        return round(float(atr.iloc[-1]), 4)
 
     def get_trend_direction(self, symbol: str) -> str:
-        """
-        Multi-timeframe trend filter.
-        Both H4 and Daily EMA20 must agree for a non-neutral result.
-        """
-        # Daily EMA
         df_daily = self.feed.get_candles(symbol, "1d", 30)
         if df_daily is None or len(df_daily) < self.config.ema_period:
-            logger.info("Trend filter | daily=insufficient_data h4=skipped → neutral")
+            logger.info(f"{symbol} trend filter | daily=insufficient_data → neutral")
             return "neutral"
-        ema_daily  = df_daily["close"].ewm(span=self.config.ema_period).mean()
-        price_d    = float(df_daily["close"].iloc[-1])
-        ema_d_val  = float(ema_daily.iloc[-1])
+        ema_daily = df_daily["close"].ewm(span=self.config.ema_period).mean()
+        price_d   = float(df_daily["close"].iloc[-1])
+        ema_d_val = float(ema_daily.iloc[-1])
         if price_d > ema_d_val * 1.001:
             daily_trend = "bullish"
         elif price_d < ema_d_val * 0.999:
@@ -76,13 +82,12 @@ class XAUUSDStrategy:
         else:
             daily_trend = "neutral"
 
-        # H4 EMA
         try:
             df_h4 = self.feed.get_candles(symbol, "4h", 60)
         except Exception:
             df_h4 = None
         if df_h4 is None or len(df_h4) < self.config.ema_period:
-            logger.info(f"Trend filter | daily={daily_trend} h4=unavailable → neutral")
+            logger.info(f"{symbol} trend filter | daily={daily_trend} h4=unavailable → neutral")
             return "neutral"
         ema_h4     = df_h4["close"].ewm(span=self.config.ema_period).mean()
         price_h4   = float(df_h4["close"].iloc[-1])
@@ -94,7 +99,7 @@ class XAUUSDStrategy:
         else:
             h4_trend = "neutral"
 
-        logger.info(f"Trend filter | daily={daily_trend} h4={h4_trend}")
+        logger.info(f"{symbol} trend filter | daily={daily_trend} h4={h4_trend}")
 
         if daily_trend == "bullish" and h4_trend == "bullish":
             return "bullish"
@@ -104,23 +109,24 @@ class XAUUSDStrategy:
 
     # ── Range calculators ────────────────────────────────────────────────────
 
-    def calculate_asian_range(self, df: pd.DataFrame) -> Optional[dict]:
-        """Asian session (00:00–07:00 UTC) high/low from H1 data."""
-        asian = df[df.index.hour < self.config.asian_session_end]
+    def calculate_asian_range(self, df: pd.DataFrame, symbol: str) -> Optional[dict]:
+        pair     = self.get_pair_settings(symbol)
+        pip_size = pair['pip_size']
+        asian    = df[df.index.hour < self.config.asian_session_end]
         if len(asian) < 3:
             return None
-        high          = float(asian["high"].max())
-        low           = float(asian["low"].min())
-        range_dollars = high - low
+        high       = float(asian["high"].max())
+        low        = float(asian["low"].min())
+        range_pips = (high - low) / pip_size
         return {
-            "high":          high,
-            "low":           low,
-            "range_dollars": round(range_dollars, 2),
-            "valid":         self.config.min_range_dollars <= range_dollars <= self.config.max_range_dollars,
+            "high":       high,
+            "low":        low,
+            "range_pips": round(range_pips, 1),
+            "valid":      pair['min_range'] <= range_pips <= pair['max_range'],
+            "pip_size":   pip_size,
         }
 
     def calculate_london_range(self, df: pd.DataFrame) -> Optional[dict]:
-        """London session (07:00–10:00 UTC) high/low for NY breakout reference."""
         mask   = (df.index.hour >= self.config.london_session_start) & \
                  (df.index.hour < self.config.london_session_end)
         london = df[mask]
@@ -135,44 +141,44 @@ class XAUUSDStrategy:
 
     def get_signal(self, symbol: str) -> dict:
         if not self.is_market_open():
-            return {"direction": "NONE", "reason": "market_closed"}
+            return {"direction": "NONE", "reason": "market_closed", "symbol": symbol}
 
         df = self.feed.get_candles(symbol, "1h", 50)
         if df is None or len(df) < 20:
-            return {"direction": "NONE", "reason": "insufficient_data"}
+            return {"direction": "NONE", "reason": "insufficient_data", "symbol": symbol}
 
         tick = self.feed.get_tick(symbol)
         if not tick:
-            return {"direction": "NONE", "reason": "no_tick"}
+            return {"direction": "NONE", "reason": "no_tick", "symbol": symbol}
+
+        pair     = self.get_pair_settings(symbol)
+        pip_size = pair['pip_size']
+        buf      = pair['buffer'] * pip_size   # buffer in price units
 
         current_price = tick["ask"]
-        rsi   = self.calculate_rsi(df)
-        atr   = self.calculate_atr(df)
-        trend = self.get_trend_direction(symbol)
-        buf   = self.config.breakout_buffer_dollars  # fixed $0.20
+        rsi           = self.calculate_rsi(df)
+        atr           = self.calculate_atr(df)
+        trend         = self.get_trend_direction(symbol)
 
         logger.info(
-            f"Signal check | price={current_price:.2f} rsi={rsi} "
-            f"atr={atr:.2f} trend={trend} buf=${buf:.2f}"
+            f"{symbol} signal check | price={current_price:.5f} rsi={rsi} "
+            f"atr={atr:.5f} trend={trend} buf={buf:.5f}"
         )
 
-        # ── LONDON SESSION (07:00–10:00 UTC) — Asian range breakout ──────────────
+        # ── LONDON SESSION — Asian range breakout ─────────────────────────────
         if self.is_london_session():
-            asian_range = self.calculate_asian_range(df)
+            asian_range = self.calculate_asian_range(df, symbol)
             if asian_range:
                 logger.info(
-                    f"Gold Asian range | high=${asian_range['high']:.2f} "
-                    f"low=${asian_range['low']:.2f} range=${asian_range['range_dollars']:.2f} "
+                    f"{symbol} Asian range | high={asian_range['high']:.5f} "
+                    f"low={asian_range['low']:.5f} range={asian_range['range_pips']:.1f}pips "
                     f"valid={asian_range['valid']}"
                 )
 
-            logger.info(
-                f"Session: LONDON | price={current_price:.2f} rsi={rsi} trend={trend}"
-            )
+            logger.info(f"{symbol} session=LONDON | price={current_price:.5f} rsi={rsi} trend={trend}")
 
             if not asian_range or not asian_range["valid"]:
-                logger.info("Signal: NONE | reason=invalid_asian_range | session=LONDON")
-                return {"direction": "NONE", "reason": "invalid_asian_range"}
+                return {"direction": "NONE", "reason": "invalid_asian_range", "symbol": symbol}
 
             buy_level  = asian_range["high"] + buf
             sell_level = asian_range["low"]  - buf
@@ -183,7 +189,7 @@ class XAUUSDStrategy:
                 tp          = current_price + (sl_distance * self.config.rr_ratio)
                 return self._build_signal(
                     direction="BUY", entry=current_price, sl=sl, tp=tp,
-                    rsi=rsi, trend=trend, session="LONDON",
+                    rsi=rsi, trend=trend, session="LONDON", symbol=symbol,
                 )
 
             if current_price < sell_level and rsi < self.config.rsi_sell_threshold and trend == "bearish":
@@ -192,25 +198,23 @@ class XAUUSDStrategy:
                 tp          = current_price - (sl_distance * self.config.rr_ratio)
                 return self._build_signal(
                     direction="SELL", entry=current_price, sl=sl, tp=tp,
-                    rsi=rsi, trend=trend, session="LONDON",
+                    rsi=rsi, trend=trend, session="LONDON", symbol=symbol,
                 )
 
-            logger.info("Signal: NONE | reason=no_signal | session=LONDON")
-            return {"direction": "NONE", "reason": "no_signal"}
+            return {"direction": "NONE", "reason": "no_signal", "symbol": symbol}
 
-        # ── NY SESSION (13:00–16:00 UTC) — London range breakout ─────────────
+        # ── NY SESSION — London range breakout ────────────────────────────────
         elif self.is_ny_session():
             london_range = self.calculate_london_range(df)
             if not london_range:
-                logger.info("Signal: NONE | reason=no_london_range | session=NY")
-                return {"direction": "NONE", "reason": "no_london_range"}
+                return {"direction": "NONE", "reason": "no_london_range", "symbol": symbol}
 
             buy_level  = london_range["high"] + buf
             sell_level = london_range["low"]  - buf
 
             logger.info(
-                f"Session: NY | price={current_price:.2f} rsi={rsi} trend={trend} "
-                f"london_high=${london_range['high']:.2f} london_low=${london_range['low']:.2f}"
+                f"{symbol} session=NY | price={current_price:.5f} rsi={rsi} trend={trend} "
+                f"london_high={london_range['high']:.5f} london_low={london_range['low']:.5f}"
             )
 
             if current_price > buy_level and rsi > self.config.rsi_buy_threshold and trend == "bullish":
@@ -219,7 +223,7 @@ class XAUUSDStrategy:
                 tp          = current_price + (sl_distance * self.config.rr_ratio)
                 return self._build_signal(
                     direction="BUY", entry=current_price, sl=sl, tp=tp,
-                    rsi=rsi, trend=trend, session="NY",
+                    rsi=rsi, trend=trend, session="NY", symbol=symbol,
                 )
 
             if current_price < sell_level and rsi < self.config.rsi_sell_threshold and trend == "bearish":
@@ -228,34 +232,48 @@ class XAUUSDStrategy:
                 tp          = current_price - (sl_distance * self.config.rr_ratio)
                 return self._build_signal(
                     direction="SELL", entry=current_price, sl=sl, tp=tp,
-                    rsi=rsi, trend=trend, session="NY",
+                    rsi=rsi, trend=trend, session="NY", symbol=symbol,
                 )
 
-            logger.info("Signal: NONE | reason=no_signal | session=NY")
-            return {"direction": "NONE", "reason": "no_signal"}
+            return {"direction": "NONE", "reason": "no_signal", "symbol": symbol}
 
-        return {"direction": "NONE", "reason": "no_signal"}
+        return {"direction": "NONE", "reason": "no_signal", "symbol": symbol}
 
     def _build_signal(self, direction: str, entry: float, sl: float, tp: float,
-                      rsi: float, trend: str, session: str) -> dict:
+                      rsi: float, trend: str, session: str, symbol: str) -> dict:
+        pair     = self.get_pair_settings(symbol)
+        pip_size = pair['pip_size']
+
         if direction == "BUY":
             sl_distance = entry - sl
-            confidence  = "high" if rsi > self.config.rsi_buy_threshold else "medium"
+            confidence  = "high" if rsi > self.config.rsi_buy_threshold + 5 else "medium"
         else:
             sl_distance = sl - entry
-            confidence  = "high" if rsi < self.config.rsi_sell_threshold else "medium"
+            confidence  = "high" if rsi < self.config.rsi_sell_threshold - 5 else "medium"
 
-        sl_pips = sl_distance / self.config.pip_size
+        sl_pips = sl_distance / pip_size
+        decimals = 2 if symbol == "XAUUSD" else (3 if "JPY" in symbol else 5)
+
+        logger.info(
+            f"{symbol} {direction} signal | session={session} entry={round(entry, decimals)} "
+            f"sl={round(sl, decimals)} tp={round(tp, decimals)} "
+            f"sl_pips={round(sl_pips, 1)} rsi={rsi} trend={trend}"
+        )
 
         return {
             "direction":   direction,
-            "entry":       round(entry, 2),
-            "stop_loss":   round(sl, 2),
-            "take_profit": round(tp, 2),
+            "symbol":      symbol,
+            "entry":       round(entry, decimals),
+            "stop_loss":   round(sl, decimals),
+            "take_profit": round(tp, decimals),
             "sl_pips":     round(sl_pips, 1),
-            "sl_dollars":  round(sl_distance, 2),
+            "sl_dollars":  round(sl_distance, decimals),  # kept for backward compat
             "rsi":         rsi,
             "trend":       trend,
             "session":     session,
             "confidence":  confidence,
         }
+
+
+# Alias for backward compatibility
+LondonBreakoutStrategy = XAUUSDStrategy

@@ -1,9 +1,8 @@
 """
-XAUUSD Gold Bot — London + NY Breakout Strategy
-Usage:
-  python main.py --paper      paper trading via yfinance
-  python main.py --live       live trading via MT5
-  python main.py --backtest   run backtest engine
+Multi-Pair London Breakout Bot
+  Pairs:   XAUUSD · GBPUSD · USDJPY
+  Session: London (07-10 UTC) + NY (13-16 UTC)
+  Mode:    --paper | --live | --backtest
 """
 
 import argparse
@@ -14,7 +13,7 @@ import time
 from collections import deque
 from datetime import datetime
 
-from config import settings
+from config import settings, PAIR_SETTINGS
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -57,27 +56,24 @@ def run_paper(args):
     feed.connect()
 
     strategy = XAUUSDStrategy(settings, feed)
-    risk = RiskManager(settings, feed, db)
+    risk     = RiskManager(settings, feed, db)
     executor = TradeExecutor(settings, feed, db)
     news_filter = NewsFilter(settings)
-    notifier = TelegramNotifier(settings)
-    dashboard = DashboardServer(settings)
+    notifier    = TelegramNotifier(settings)
+    dashboard   = DashboardServer(settings)
     dashboard.start()
 
     balance = feed.get_account_info().get("balance", 5000.0)
     notifier.send_startup("paper", balance)
-    logger.info(f"XAUUSD Gold Bot started in PAPER mode | balance=${balance:.2f}")
+    logger.info(
+        f"Multi-Pair Bot started | PAPER mode | "
+        f"pairs={settings.symbols} balance=${balance:.2f}"
+    )
 
     _main_loop(
-        feed=feed,
-        strategy=strategy,
-        risk=risk,
-        executor=executor,
-        news_filter=news_filter,
-        notifier=notifier,
-        dashboard=dashboard,
-        db=db,
-        mode="paper",
+        feed=feed, strategy=strategy, risk=risk, executor=executor,
+        news_filter=news_filter, notifier=notifier, dashboard=dashboard,
+        db=db, mode="paper",
     )
 
 
@@ -93,32 +89,29 @@ def run_live(args):
         sys.exit(1)
 
     strategy = XAUUSDStrategy(settings, feed)
-    risk = RiskManager(settings, feed, db)
+    risk     = RiskManager(settings, feed, db)
     executor = TradeExecutor(settings, feed, db)
     news_filter = NewsFilter(settings)
-    notifier = TelegramNotifier(settings)
-    dashboard = DashboardServer(settings)
+    notifier    = TelegramNotifier(settings)
+    dashboard   = DashboardServer(settings)
     dashboard.start()
 
     balance = feed.get_account_info().get("balance", 0.0)
     notifier.send_startup("live", balance)
-    logger.info(f"XAUUSD Gold Bot started in LIVE mode | balance=${balance:.2f}")
+    logger.info(
+        f"Multi-Pair Bot started | LIVE mode | "
+        f"pairs={settings.symbols} balance=${balance:.2f}"
+    )
 
     _main_loop(
-        feed=feed,
-        strategy=strategy,
-        risk=risk,
-        executor=executor,
-        news_filter=news_filter,
-        notifier=notifier,
-        dashboard=dashboard,
-        db=db,
-        mode="live",
+        feed=feed, strategy=strategy, risk=risk, executor=executor,
+        news_filter=news_filter, notifier=notifier, dashboard=dashboard,
+        db=db, mode="live",
     )
 
 
 def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard, db, mode):
-    logger.info("Main loop started — polling every 60s")
+    logger.info(f"Main loop started — pairs={settings.symbols} polling every 60s")
     last_daily_report = None
 
     while True:
@@ -132,14 +125,31 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
                     last_daily_report = today_key
                     _send_daily_report(db, risk, notifier)
 
-            # ── Dashboard state ────────────────────────────────────────────
-            tick = feed.get_tick(settings.symbol)
-            account = feed.get_account_info()
+            # ── Aggregate tick data for dashboard ──────────────────────────
+            prices      = {}
+            for sym in settings.symbols:
+                t = feed.get_tick(sym)
+                if t:
+                    prices[sym] = t
+            # Use first available price for legacy dashboard price field
+            price_tick = prices.get(settings.symbols[0], {})
+
+            account   = feed.get_account_info()
             positions = feed.get_positions()
             trades_db = db.get_trades(limit=50) if db.conn else []
             daily_pnl = db.get_daily_pnl() if db.conn else 0.0
             news_active, news_msg, news_upcoming = news_filter.check(hours_ahead=4)
             equity_curve = db.get_equity_curve(limit=100) if db.conn else []
+
+            # Per-pair stats for dashboard
+            pair_stats = {}
+            for sym in settings.symbols:
+                pair_stats[sym] = db.get_pair_stats(sym) if db.conn else {}
+
+            # Per-pair current positions for dashboard
+            pair_positions = {}
+            for sym in settings.symbols:
+                pair_positions[sym] = [p for p in positions if p.get("symbol") == sym]
 
             dashboard.update(
                 mode=mode,
@@ -147,17 +157,22 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
                 equity=account.get("equity", 0) if account else 0,
                 daily_pnl=daily_pnl,
                 open_positions=len(positions),
-                price=tick or {},
+                price=price_tick,
+                prices=prices,
                 positions=positions,
                 trades=trades_db,
                 risk={
-                    "daily_loss_pct": risk.get_daily_loss_pct(),
-                    "drawdown_pct": risk.get_total_drawdown_pct(),
-                    "open_positions": len(positions),
+                    "daily_loss_pct":  risk.get_daily_loss_pct(),
+                    "drawdown_pct":    risk.get_total_drawdown_pct(),
+                    "open_positions":  len(positions),
+                    "max_positions":   settings.max_total_positions,
                 },
                 news=news_upcoming,
                 equity_curve=equity_curve,
                 logs=list(LOG_BUFFER),
+                pair_stats=pair_stats,
+                pair_positions=pair_positions,
+                symbols=settings.symbols,
             )
 
             # ── Equity snapshot ────────────────────────────────────────────
@@ -168,43 +183,38 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
                     drawdown=risk.get_total_drawdown_pct(),
                 )
 
-            # ── Monitor open positions ─────────────────────────────────────
+            # ── Monitor open positions (SL/TP, breakeven, time limit) ──────
             for pos in positions:
                 _manage_position(pos, feed, risk, executor, notifier, db, mode)
 
-            # ── Friday close ───────────────────────────────────────────────
+            # ── Friday close — close all pairs ─────────────────────────────
             if risk.should_close_friday() and positions:
-                logger.info("Friday close — closing all positions")
-                for pos in positions:
+                logger.info("Friday close — closing all pairs")
+                for pos in list(positions):
                     _close_position(pos, feed, executor, notifier, db, mode, reason="friday_close")
                 time.sleep(60)
                 continue
 
-            # ── Trading guards ─────────────────────────────────────────────
+            # ── Global risk guards ─────────────────────────────────────────
             can_trade, reason = risk.can_trade()
             if not can_trade:
                 logger.info(f"Trading blocked: {reason}")
                 time.sleep(60)
                 continue
 
-            if positions:
-                logger.info(f"Position open — skipping signal check")
-                time.sleep(60)
-                continue
-
-            # ── News filter (result already computed above in dashboard section)
+            # ── News filter ────────────────────────────────────────────────
             if news_active:
                 logger.info(f"News block: {news_msg}")
                 time.sleep(60)
                 continue
 
-            # ── Signal check ───────────────────────────────────────────────
+            # ── Session guard ──────────────────────────────────────────────
             if not (strategy.is_london_session() or strategy.is_ny_session()):
                 h, m = now.hour, now.minute
                 if h < settings.london_session_start:
                     mins = (settings.london_session_start - h) * 60 - m
                     next_msg = f"London opens in {mins // 60}h {mins % 60}m"
-                elif h >= settings.london_session_end and h < settings.ny_session_start:
+                elif settings.london_session_end <= h < settings.ny_session_start:
                     mins = (settings.ny_session_start - h) * 60 - m
                     next_msg = f"NY opens in {mins // 60}h {mins % 60}m"
                 else:
@@ -216,25 +226,54 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
                 time.sleep(60)
                 continue
 
-            signal = strategy.get_signal(settings.symbol)
-            logger.info(f"Signal: {signal}")
+            # ── Multi-pair signal loop ─────────────────────────────────────
+            # Refresh positions after any management actions above
+            positions = feed.get_positions()
 
-            if signal.get("direction") not in ("BUY", "SELL"):
+            if len(positions) >= settings.max_total_positions:
+                logger.info(
+                    f"Max positions reached "
+                    f"({len(positions)}/{settings.max_total_positions}) — skipping signal check"
+                )
                 time.sleep(60)
                 continue
 
-            # ── Execute trade ──────────────────────────────────────────────
-            lot_size = risk.calculate_lot_size(settings.symbol, signal["sl_dollars"])
-            balance = account.get("balance", 5000.0) if account else 5000.0
+            for symbol in settings.symbols:
+                # Cap total positions
+                if len(positions) >= settings.max_total_positions:
+                    logger.info(
+                        f"Max positions reached mid-loop "
+                        f"({len(positions)}/{settings.max_total_positions})"
+                    )
+                    break
 
-            trade = executor.execute_signal(signal, lot_size)
-            if trade:
-                logger.info(
-                    f"Trade opened | {signal['direction']} {lot_size} lots "
-                    f"entry=${signal['entry']:.2f} SL=${signal['stop_loss']:.2f} "
-                    f"TP=${signal['take_profit']:.2f} [{signal.get('session')}]"
-                )
-                notifier.send_signal(signal, lot_size, balance)
+                # Skip if this pair already has an open position
+                pair_pos = [p for p in positions if p.get("symbol") == symbol]
+                if pair_pos:
+                    logger.debug(f"{symbol} position already open — skipping")
+                    continue
+
+                signal = strategy.get_signal(symbol)
+                logger.info(f"{symbol} signal: {signal.get('direction')} | {signal.get('reason', '')}")
+
+                if signal.get("direction") not in ("BUY", "SELL"):
+                    continue
+
+                # Calculate lot size using sl_pips
+                lot_size = risk.calculate_lot_size(symbol, signal["sl_pips"])
+                balance  = account.get("balance", 5000.0) if account else 5000.0
+
+                trade = executor.execute_signal(signal, lot_size)
+                if trade:
+                    logger.info(
+                        f"Trade opened | {symbol} {signal['direction']} {lot_size} lots "
+                        f"entry={signal['entry']} SL={signal['stop_loss']} "
+                        f"TP={signal['take_profit']} [{signal.get('session')}]"
+                    )
+                    notifier.send_signal(signal, lot_size, balance)
+
+                # Refresh position count
+                positions = feed.get_positions()
 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
@@ -246,43 +285,47 @@ def _main_loop(feed, strategy, risk, executor, news_filter, notifier, dashboard,
 
 
 def _manage_position(pos, feed, risk, executor, notifier, db, mode):
-    # Time limit
     if risk.should_close_by_time(pos):
-        logger.info(f"Time limit reached for ticket {pos['ticket']}")
+        logger.info(f"Time limit reached for ticket {pos['ticket']} ({pos.get('symbol')})")
         _close_position(pos, feed, executor, notifier, db, mode, reason="time_limit")
         return
 
-    # Paper SL/TP check
     if mode == "paper":
         tick = feed.get_tick(pos["symbol"])
         if tick:
             if pos["type"] == "BUY":
                 if tick["bid"] <= pos["sl"]:
-                    _close_position(pos, feed, executor, notifier, db, mode, reason="stop_loss", close_price=pos["sl"])
+                    _close_position(pos, feed, executor, notifier, db, mode,
+                                    reason="stop_loss", close_price=pos["sl"])
                     return
                 if tick["bid"] >= pos["tp"]:
-                    _close_position(pos, feed, executor, notifier, db, mode, reason="take_profit", close_price=pos["tp"])
+                    _close_position(pos, feed, executor, notifier, db, mode,
+                                    reason="take_profit", close_price=pos["tp"])
                     return
             else:
                 if tick["ask"] >= pos["sl"]:
-                    _close_position(pos, feed, executor, notifier, db, mode, reason="stop_loss", close_price=pos["sl"])
+                    _close_position(pos, feed, executor, notifier, db, mode,
+                                    reason="stop_loss", close_price=pos["sl"])
                     return
                 if tick["ask"] <= pos["tp"]:
-                    _close_position(pos, feed, executor, notifier, db, mode, reason="take_profit", close_price=pos["tp"])
+                    _close_position(pos, feed, executor, notifier, db, mode,
+                                    reason="take_profit", close_price=pos["tp"])
                     return
 
-    # Breakeven
     new_sl = risk.check_breakeven(pos)
     if new_sl:
         if mode == "paper":
             feed.update_sl(pos["ticket"], new_sl)
         else:
             executor.modify_sl_mt5(pos["ticket"], new_sl)
-        logger.info(f"Breakeven set for ticket {pos['ticket']} new_sl={new_sl:.2f}")
+        logger.info(
+            f"Breakeven set | {pos.get('symbol')} ticket={pos['ticket']} new_sl={new_sl}"
+        )
 
 
 def _close_position(pos, feed, executor, notifier, db, mode, reason="manual", close_price=None):
-    tick = feed.get_tick(pos["symbol"])
+    symbol = pos.get("symbol", settings.symbol)
+    tick   = feed.get_tick(symbol)
     if close_price is None and tick:
         close_price = tick["bid"] if pos["type"] == "BUY" else tick["ask"]
 
@@ -291,31 +334,35 @@ def _close_position(pos, feed, executor, notifier, db, mode, reason="manual", cl
         pnl = closed["profit"] if closed else 0.0
     else:
         executor.close_position_mt5(pos, reason)
-        tick = feed.get_tick(pos["symbol"])
-        cp = tick["bid"] if tick and pos["type"] == "BUY" else (tick["ask"] if tick else 0)
+        tick = feed.get_tick(symbol)
+        cp   = (tick["bid"] if pos["type"] == "BUY" else tick["ask"]) if tick else 0.0
+        pair = PAIR_SETTINGS.get(symbol, {})
+        pip_size = pair.get('pip_size', 0.01)
+        pip_val  = pair.get('pip_value', 1.0)
         if pos["type"] == "BUY":
-            pnl = (cp - pos["price_open"]) * pos["volume"] * 100
+            pips = (cp - pos["price_open"]) / pip_size
         else:
-            pnl = (pos["price_open"] - cp) * pos["volume"] * 100
-        pnl = round(pnl, 2)
+            pips = (pos["price_open"] - cp) / pip_size
+        pnl = round(pips * pip_val * pos["volume"], 2)
 
+    risk_mgr_pnl = pnl   # passed separately to avoid circular import
     notifier.send_close(pos, pnl, reason)
     if db.conn:
-        db.close_trade(pos["ticket"], close_price or 0.0, pnl, reason)
-    from bot.risk_manager import RiskManager  # local import to avoid circular
-    # record for daily tracking (handled inside risk manager externally)
-    logger.info(f"Position closed | ticket={pos['ticket']} pnl=${pnl:.2f} reason={reason}")
+        db.close_trade(pos["ticket"], close_price or 0.0, pnl, reason, symbol=symbol)
+    logger.info(
+        f"Position closed | {symbol} ticket={pos['ticket']} pnl=${pnl:.2f} reason={reason}"
+    )
 
 
 def _send_daily_report(db, risk, notifier):
-    daily_pnl = db.get_daily_pnl() if db.conn else 0.0
-    trades = db.get_trades(limit=100) if db.conn else []
+    daily_pnl   = db.get_daily_pnl() if db.conn else 0.0
+    trades      = db.get_trades(limit=100) if db.conn else []
     today_trades = [t for t in trades if t.get("status") == "closed"]
-    wins = sum(1 for t in today_trades if (t.get("pnl") or 0) > 0)
+    wins         = sum(1 for t in today_trades if (t.get("pnl") or 0) > 0)
     notifier.send_daily_report({
-        "daily_pnl": daily_pnl,
+        "daily_pnl":    daily_pnl,
         "daily_trades": len(today_trades),
-        "daily_wins": wins,
+        "daily_wins":   wins,
         "drawdown_pct": risk.get_total_drawdown_pct(),
     })
 
@@ -323,10 +370,10 @@ def _send_daily_report(db, risk, notifier):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="XAUUSD Gold Bot")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--paper", action="store_true", help="Paper trading mode")
-    group.add_argument("--live", action="store_true", help="Live MT5 trading")
+    parser = argparse.ArgumentParser(description="Multi-Pair London Breakout Bot")
+    group  = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--paper",    action="store_true", help="Paper trading mode")
+    group.add_argument("--live",     action="store_true", help="Live MT5 trading")
     group.add_argument("--backtest", action="store_true", help="Run backtest")
     parser.add_argument(
         "--source",
